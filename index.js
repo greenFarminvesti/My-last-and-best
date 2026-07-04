@@ -1,11 +1,16 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const crypto = require("crypto");
+const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
-app.use(express.json());
 
+// Enable CORS
+app.use(cors());
+
+// Parse JSON
+app.use(express.json());
 // ======================
 // MongoDB Connection
 // ======================
