@@ -1,149 +1,172 @@
 const express = require("express");
-const cors = require("cors");
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 require("dotenv").config();
 
 const app = express();
-
-// ======================
-// Middlewares
-// ======================
-app.use(cors()); // Fixes "Failed to fetch"
 app.use(express.json());
 
 // ======================
-// 1. DATABASE CONNECTION
+// MongoDB Connection
 // ======================
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log("✅ Database Connected"))
-  .catch(err => console.error("❌ Database Error:", err));
+  .then(() => console.log("✅ MongoDB Connected"))
+  .catch(err => console.error("❌ MongoDB Error:", err));
 
 // ======================
-// 2. MODELS
+// Schemas & Models
 // ======================
-const User = mongoose.model("User", new mongoose.Schema({
+const UserSchema = new mongoose.Schema({
   userId: { type: String, required: true, unique: true },
+  username: { type: String, default: "" },
+  walletAddress: { type: String, default: "" },
   balance: { type: Number, default: 0 },
   totalWithdrawn: { type: Number, default: 0 }
-}, { timestamps: true }));
+}, { timestamps: true });
 
-const Transaction = mongoose.model("Transaction", new mongoose.Schema({
-  userId: String,
-  transferId: String,
-  amount: Number,
-  status: { type: String, default: "pending" }, 
-}, { timestamps: true }));
+const User = mongoose.model("User", UserSchema);
+
+const TransactionSchema = new mongoose.Schema({
+  userId: { type: String, required: true },
+  transferId: { type: String, default: "" },
+  walletAddress: { type: String, required: true },
+  amount: { type: Number, required: true },
+  currency: { type: String, default: "DOGS" },
+  status: { 
+    type: String, 
+    enum: ["pending", "processing", "paid", "failed"], 
+    default: "pending" 
+  },
+  paidAt: Date
+}, { timestamps: true });
+
+const Transaction = mongoose.model("Transaction", TransactionSchema);
 
 // ======================
-// 3. XROCKET API HELPER
+// xRocket Helper Function
 // ======================
 async function sendPayout(tgUserId, amount) {
   const transferId = crypto.randomUUID();
-  
+
   const response = await fetch("https://pay.xrocket.exchange/app/transfer", {
     method: "POST",
     headers: {
       "Rocket-Pay-Key": process.env.ROCKET_PAY_KEY,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
+      "Accept": "application/json"
     },
     body: JSON.stringify({
-      tgUserId: Number(tgUserId),
+      tgUserId: Number(tgUserId), // Ensure it's a number
       currency: "DOGS",
-      amount: Number(amount),
+      amount: amount,
       transferId: transferId,
-      description: "Withdrawal from Mini App"
+      description: "Auto payout from Mini App"
     })
   });
 
-  const data = await response.json().catch(() => ({}));
+  const data = await response.json();
 
   if (!response.ok) {
-    throw new Error(data.message || `xRocket Error: ${response.status}`);
+    throw new Error(data.message || "xRocket Transfer failed");
   }
 
-  return transferId;
+  return { transferId, data };
 }
 
 // ======================
-// 4. ROUTES
+// Routes
 // ======================
 
-app.get("/", (req, res) => res.send("API is Live 🚀"));
-
-// GET USER DATA
-app.get("/api/user/:userId", async (req, res) => {
-  try {
-    const user = await User.findOne({ userId: req.params.userId });
-    if (!user) return res.status(404).json({ message: "User not found" });
-    res.json(user);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+// 1. Home Route
+app.get("/", (req, res) => {
+  res.json({ success: true, status: "Running", service: "Mini Withdraw Backend" });
 });
 
-// WITHDRAW ROUTE
+// 2. Withdraw Route
 app.post("/api/withdraw", async (req, res) => {
-  const { userId, tgUserId, amount } = req.body;
-
   try {
-    const user = await User.findOne({ userId });
-    
-    if (!user || user.balance < amount) {
-      return res.status(400).json({ success: false, message: "Insufficient balance" });
+    const { userId, tgUserId, walletAddress, amount } = req.body;
+
+    if (!userId || !tgUserId || !walletAddress || !amount) {
+      return res.status(400).json({ success: false, message: "Missing required fields" });
     }
 
-    // 1. Call xRocket first
-    const transferId = await sendPayout(tgUserId, amount);
+    const user = await User.findOne({ userId });
 
-    // 2. If payout call succeeded, deduct balance
-    user.balance -= amount;
-    user.totalWithdrawn += amount;
-    await user.save();
+    if (!user || user.balance < amount) {
+      return res.status(400).json({ success: false, message: "Insufficient balance or user not found" });
+    }
 
-    // 3. Log transaction
-    await Transaction.create({
+    // 1. Create a "processing" transaction record first
+    const transaction = await Transaction.create({
       userId,
-      transferId,
+      walletAddress,
       amount,
       status: "processing"
     });
 
-    res.json({ success: true, message: "Withdrawal processing!" });
+    // 2. Attempt xRocket payout
+    const payout = await sendPayout(tgUserId, amount);
+
+    // 3. Update User Balance
+    user.balance -= amount;
+    user.totalWithdrawn += amount;
+    await user.save();
+
+    // 4. Update Transaction with xRocket transferId
+    transaction.transferId = payout.transferId;
+    await transaction.save();
+
+    res.json({
+      success: true,
+      message: "Withdrawal submitted",
+      transferId: payout.transferId
+    });
 
   } catch (error) {
-    console.error("Withdraw Error:", error.message);
+    console.error("Withdraw Error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// WEBHOOK ROUTE
+// 3. Webhook Route (Called by xRocket)
 app.post("/api/webhook/xrocket", async (req, res) => {
-  const { transfer_id, status } = req.body;
-  
-  const tx = await Transaction.findOne({ transferId: transfer_id });
-  if (!tx) return res.sendStatus(404);
+  try {
+    console.log("📥 xRocket Webhook Received:", req.body);
 
-  if (status === "completed") {
-    tx.status = "paid";
-  } else if (status === "failed") {
-    if (tx.status !== "failed") {
-        tx.status = "failed";
-        const user = await User.findOne({ userId: tx.userId });
-        if (user) {
-          user.balance += tx.amount;
-          user.totalWithdrawn -= tx.amount;
-          await user.save();
-        }
+    const { transfer_id, status } = req.body; 
+
+    const transaction = await Transaction.findOne({ transferId: transfer_id });
+    if (!transaction) return res.status(404).send("Transaction not found");
+
+    if (status === "completed") {
+      transaction.status = "paid";
+      transaction.paidAt = new Date();
+    } 
+    else if (status === "failed") {
+      transaction.status = "failed";
+      // Refund the user if the payout failed
+      const user = await User.findOne({ userId: transaction.userId });
+      if (user) {
+        user.balance += transaction.amount;
+        user.totalWithdrawn -= transaction.amount;
+        await user.save();
+      }
     }
+
+    await transaction.save();
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error("Webhook Error:", error);
+    res.status(500).json({ error: error.message });
   }
-  
-  await tx.save();
-  res.json({ received: true });
 });
 
 // ======================
-// START SERVER
+// Start Server
 // ======================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
