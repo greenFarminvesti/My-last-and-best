@@ -1,32 +1,43 @@
 const express = require("express");
+const cors = require("cors"); // Added CORS
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 require("dotenv").config();
 
 const app = express();
+
+// ======================
+// Middlewares
+// ======================
+app.use(cors()); // This fixes the "Failed to fetch" error
 app.use(express.json());
 
+// ======================
 // 1. DATABASE CONNECTION
+// ======================
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log("✅ Database Connected"))
   .catch(err => console.error("❌ Database Error:", err));
 
-// 2. USER MODEL (Keeps track of money)
+// ======================
+// 2. MODELS
+// ======================
 const User = mongoose.model("User", new mongoose.Schema({
   userId: { type: String, required: true, unique: true },
   balance: { type: Number, default: 0 },
   totalWithdrawn: { type: Number, default: 0 }
 }, { timestamps: true }));
 
-// 3. TRANSACTION MODEL (History of payments)
 const Transaction = mongoose.model("Transaction", new mongoose.Schema({
   userId: String,
   transferId: String,
   amount: Number,
-  status: { type: String, default: "pending" }, // pending, paid, failed
+  status: { type: String, default: "pending" }, 
 }, { timestamps: true }));
 
-// 4. XROCKET API HELPER
+// ======================
+// 3. XROCKET API HELPER
+// ======================
 async function sendPayout(tgUserId, amount) {
   const transferId = crypto.randomUUID();
   const response = await fetch("https://pay.xrocket.exchange/app/transfer", {
@@ -43,27 +54,43 @@ async function sendPayout(tgUserId, amount) {
       description: "Withdrawal from Mini App"
     })
   });
+
   const data = await response.json();
   if (!response.ok) throw new Error(data.message || "xRocket Error");
   return transferId;
 }
 
-// 5. WITHDRAW ROUTE (The feature users click)
+// ======================
+// 4. ROUTES
+// ======================
+
+// GET USER DATA (Added Feature: Use this to show balance on your app)
+app.get("/api/user/:userId", async (req, res) => {
+  try {
+    const user = await User.findOne({ userId: req.params.userId });
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// WITHDRAW ROUTE
 app.post("/api/withdraw", async (req, res) => {
   const { userId, tgUserId, amount } = req.body;
 
   try {
     const user = await User.findOne({ userId });
     
-    // Feature: Balance Validation
+    // Validation
     if (!user || user.balance < amount) {
       return res.status(400).json({ success: false, message: "Insufficient balance" });
     }
 
-    // Feature: Send Payout
+    // Call xRocket
     const transferId = await sendPayout(tgUserId, amount);
 
-    // Feature: Update Database
+    // Update Database immediately (locking the funds)
     user.balance -= amount;
     user.totalWithdrawn += amount;
     await user.save();
@@ -78,11 +105,12 @@ app.post("/api/withdraw", async (req, res) => {
     res.json({ success: true, message: "Withdrawal processing!" });
 
   } catch (error) {
+    console.error("Withdraw Error:", error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// 6. WEBHOOK ROUTE (Feature to confirm if money actually arrived)
+// WEBHOOK ROUTE
 app.post("/api/webhook/xrocket", async (req, res) => {
   const { transfer_id, status } = req.body;
   
@@ -93,7 +121,7 @@ app.post("/api/webhook/xrocket", async (req, res) => {
     tx.status = "paid";
   } else if (status === "failed") {
     tx.status = "failed";
-    // Feature: Auto-Refund logic
+    // Auto-Refund logic
     const user = await User.findOne({ userId: tx.userId });
     if (user) {
       user.balance += tx.amount;
@@ -106,8 +134,11 @@ app.post("/api/webhook/xrocket", async (req, res) => {
   res.json({ received: true });
 });
 
-// 7. HEALTH CHECK
-app.get("/", (req, res) => res.send("API is Live 🚀"));
+// HEALTH CHECK
+app.get("/", (req, res) => res.send("API is Live and CORS enabled 🚀"));
 
+// ======================
+// START SERVER
+// ======================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
