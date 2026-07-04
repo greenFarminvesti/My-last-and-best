@@ -1,5 +1,5 @@
 const express = require("express");
-const cors = require("cors"); // Added CORS
+const cors = require("cors");
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 require("dotenv").config();
@@ -9,7 +9,7 @@ const app = express();
 // ======================
 // Middlewares
 // ======================
-app.use(cors()); // This fixes the "Failed to fetch" error
+app.use(cors()); // Fixes "Failed to fetch"
 app.use(express.json());
 
 // ======================
@@ -40,6 +40,7 @@ const Transaction = mongoose.model("Transaction", new mongoose.Schema({
 // ======================
 async function sendPayout(tgUserId, amount) {
   const transferId = crypto.randomUUID();
+  
   const response = await fetch("https://pay.xrocket.exchange/app/transfer", {
     method: "POST",
     headers: {
@@ -49,14 +50,18 @@ async function sendPayout(tgUserId, amount) {
     body: JSON.stringify({
       tgUserId: Number(tgUserId),
       currency: "DOGS",
-      amount: amount,
+      amount: Number(amount),
       transferId: transferId,
       description: "Withdrawal from Mini App"
     })
   });
 
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.message || "xRocket Error");
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(data.message || `xRocket Error: ${response.status}`);
+  }
+
   return transferId;
 }
 
@@ -64,7 +69,9 @@ async function sendPayout(tgUserId, amount) {
 // 4. ROUTES
 // ======================
 
-// GET USER DATA (Added Feature: Use this to show balance on your app)
+app.get("/", (req, res) => res.send("API is Live 🚀"));
+
+// GET USER DATA
 app.get("/api/user/:userId", async (req, res) => {
   try {
     const user = await User.findOne({ userId: req.params.userId });
@@ -82,19 +89,19 @@ app.post("/api/withdraw", async (req, res) => {
   try {
     const user = await User.findOne({ userId });
     
-    // Validation
     if (!user || user.balance < amount) {
       return res.status(400).json({ success: false, message: "Insufficient balance" });
     }
 
-    // Call xRocket
+    // 1. Call xRocket first
     const transferId = await sendPayout(tgUserId, amount);
 
-    // Update Database immediately (locking the funds)
+    // 2. If payout call succeeded, deduct balance
     user.balance -= amount;
     user.totalWithdrawn += amount;
     await user.save();
 
+    // 3. Log transaction
     await Transaction.create({
       userId,
       transferId,
@@ -120,22 +127,20 @@ app.post("/api/webhook/xrocket", async (req, res) => {
   if (status === "completed") {
     tx.status = "paid";
   } else if (status === "failed") {
-    tx.status = "failed";
-    // Auto-Refund logic
-    const user = await User.findOne({ userId: tx.userId });
-    if (user) {
-      user.balance += tx.amount;
-      user.totalWithdrawn -= tx.amount;
-      await user.save();
+    if (tx.status !== "failed") {
+        tx.status = "failed";
+        const user = await User.findOne({ userId: tx.userId });
+        if (user) {
+          user.balance += tx.amount;
+          user.totalWithdrawn -= tx.amount;
+          await user.save();
+        }
     }
   }
   
   await tx.save();
   res.json({ received: true });
 });
-
-// HEALTH CHECK
-app.get("/", (req, res) => res.send("API is Live and CORS enabled 🚀"));
 
 // ======================
 // START SERVER
