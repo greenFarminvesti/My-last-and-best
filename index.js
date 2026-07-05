@@ -3,139 +3,90 @@ const express = require('express');
 const admin = require('firebase-admin');
 const axios = require('axios');
 const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const crypto = require('crypto');
 
 const app = express();
-
-// --- LOGGING ---
-const log = {
-  info: (msg) => console.log(`[INFO] ${JSON.stringify(msg)}`),
-  error: (msg) => console.error(`[ERROR] ${JSON.stringify(msg)}`)
-};
-
-app.use(helmet());
 app.use(cors());
 app.use(express.json());
 
-// --- CONNECT TO FIREBASE ---
+// --- 1. SAFE FIREBASE INIT ---
 try {
     if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-        throw new Error('Missing FIREBASE_SERVICE_ACCOUNT in Railway Variables');
+        console.error("❌ ERROR: FIREBASE_SERVICE_ACCOUNT variable is empty!");
+    } else {
+        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        console.log("✅ Firebase Admin Initialized");
     }
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
-    console.log('✅ Firebase Admin Initialized');
-} catch (err) {
-    console.error('❌ Firebase Init Error:', err.message);
-    process.exit(1); 
+} catch (e) {
+    console.error("❌ Firebase Initialization Failed:", e.message);
 }
 
-const db = admin.firestore();
+const db = admin.apps.length ? admin.firestore() : null;
 
-// --- CONFIG ---
+// --- 2. CONFIG CHECK ---
 const XROCKET_API_KEY = process.env.XROCKET_API_KEY;
-const XROCKET_BASE_URL = 'https://pay.xrocket.exchange';
 const API_SECRET = process.env.API_SECRET;
-const FEE_PERCENT = Number(process.env.FEE_PERCENT || 40);
-const DAILY_LIMIT = Number(process.env.DAILY_WITHDRAW_LIMIT || 100000);
+const PORT = process.env.PORT || 3000;
 
-if (!XROCKET_API_KEY || !API_SECRET) {
-  console.error('❌ Missing XROCKET_API_KEY or API_SECRET in Variables');
-  process.exit(1);
-}
+if (!XROCKET_API_KEY) console.error("❌ ERROR: XROCKET_API_KEY is missing!");
+if (!API_SECRET) console.error("❌ ERROR: API_SECRET is missing!");
 
-// --- HELPERS ---
-function authMiddleware(req, res, next) {
-  const key = req.header('X-API-Key');
-  if (key !== API_SECRET) {
-    return res.status(401).json({ success: false, error: 'Unauthorized' });
-  }
-  next();
-}
-
-const withdrawLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 3,
-  message: { success: false, error: 'Too many requests. Wait 1 minute.' }
-});
-
-// Official xRocket Transfer Logic
-async function callXRocketTransfer(payload) {
-  try {
-    const res = await axios.post(`${XROCKET_BASE_URL}/app/transfer`, payload, {
-      headers: {
-        'Rocket-Pay-Key': XROCKET_API_KEY,
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-      },
-      timeout: 15000
-    });
-    return { ok: true, data: res.data };
-  } catch (err) {
-    return { ok: false, error: err.response?.data?.message || err.message };
-  }
-}
-
-// --- ROUTES ---
+// --- 3. ROUTES ---
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Live', service: 'Firebase xRocket Payout', fee: `${FEE_PERCENT}%` });
+    res.json({ 
+        status: "Running", 
+        firebase: db ? "Connected" : "Disconnected",
+        xrocket: XROCKET_API_KEY ? "Key Present" : "Key Missing"
+    });
 });
 
-app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
-  const { userId, telegramId, amount, currency = 'DOGS' } = req.body;
+app.post('/withdraw', async (req, res) => {
+    const { userId, telegramId, amount } = req.body;
+    const auth = req.header('X-API-Key');
 
-  if (!userId || !telegramId || !amount) {
-    return res.status(400).json({ success: false, error: 'Missing fields' });
-  }
+    if (auth !== API_SECRET) return res.status(401).json({ error: "Unauthorized" });
+    if (!db) return res.status(500).json({ error: "Firebase not connected" });
 
-  try {
-    const userRef = db.collection('users').doc(String(userId));
-    const doc = await userRef.get();
+    try {
+        const userRef = db.collection('users').doc(String(userId));
+        const doc = await userRef.get();
 
-    if (!doc.exists) return res.status(404).json({ success: false, error: 'User not found' });
+        if (!doc.exists) return res.status(404).json({ error: "User not found" });
 
-    const currentBalance = doc.data().usdtBalance || 0;
-    if (currentBalance < amount) {
-      return res.status(400).json({ success: false, error: 'Insufficient balance' });
+        const balance = doc.data().usdtBalance || 0;
+        if (balance < amount) return res.status(400).json({ error: "Insufficient balance" });
+
+        // Calculate 40% fee
+        const netAmount = Number((amount - (amount * 0.4)).toFixed(2));
+
+        // Call xRocket
+        const response = await axios.post('https://pay.xrocket.exchange/app/transfer', {
+            tgUserId: Number(telegramId),
+            currency: 'DOGS',
+            amount: netAmount,
+            transferId: `wd_${Date.now()}`,
+            description: `Withdraw for ${userId}`
+        }, {
+            headers: { 'Rocket-Pay-Key': XROCKET_API_KEY }
+        });
+
+        // Deduct from Firebase
+        await userRef.update({
+            usdtBalance: admin.firestore.FieldValue.increment(-amount)
+        });
+
+        res.json({ success: true, transferId: response.data.data?.transferId });
+
+    } catch (err) {
+        console.error("Withdrawal Error:", err.message);
+        res.status(500).json({ error: err.response?.data?.message || err.message });
     }
-
-    const fee = (amount * FEE_PERCENT) / 100;
-    const netAmount = Number((amount - fee).toFixed(2));
-    const transferId = `wd_${Date.now()}`;
-
-    // 1. Deduct from Firebase
-    await userRef.update({
-      usdtBalance: admin.firestore.FieldValue.increment(-amount),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    // 2. Call xRocket
-    const result = await callXRocketTransfer({
-      tgUserId: Number(telegramId), // xRocket uses tgUserId
-      currency: currency,
-      amount: netAmount,
-      transferId: transferId,
-      description: `Withdraw for ${userId}`
-    });
-
-    if (result.ok) {
-      return res.json({ success: true, transferId, net: netAmount });
-    } else {
-      // 3. Refund if xRocket fails
-      await userRef.update({ usdtBalance: admin.firestore.FieldValue.increment(amount) });
-      return res.status(502).json({ success: false, error: result.error, refunded: true });
-    }
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
 });
 
-const PORT = process.env.PORT || 3000;
+// --- 4. START SERVER ---
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🚀 Server listening on port ${PORT}`);
 });
