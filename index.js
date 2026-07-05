@@ -21,14 +21,13 @@ app.use(express.json());
 // Variables
 const PORT = process.env.PORT || 3000;
 const XROCKET_API_KEY = process.env.XROCKET_API_KEY;
-const XROCKET_BASE_URL = 'https://pay.xrocket.exchange'; 
+const XROCKET_BASE_URL = 'https://pay.xrocket.exchange';
 const FEE_PERCENT = Number(process.env.FEE_PERCENT || 40);
 const API_SECRET = process.env.API_SECRET || 'your-secure-secret';
 const DAILY_LIMIT = Number(process.env.DAILY_WITHDRAW_LIMIT || 100000);
 const MONGODB_URI = process.env.MONGODB_URI;
 const MONGODB_DB = process.env.MONGODB_DB || 'watchdog_autopay';
 
-// Boot Check
 if (!XROCKET_API_KEY || !MONGODB_URI) {
   log.error('❌ Missing Critical Variables: XROCKET_API_KEY or MONGODB_URI');
   process.exit(1);
@@ -60,25 +59,32 @@ async function getBalance(userId) {
   return doc ? doc.balance : 0;
 }
 
-// Auth Middleware (To protect internal routes like /balance/add)
+async function dailyWithdrawn(userId) {
+  const since = Date.now() - 24 * 60 * 60 * 1000;
+  const result = await transactions.aggregate([
+    { $match: { userId: String(userId), status: 'completed', createdAt: { $gt: since } } },
+    { $group: { _id: null, total: { $sum: '$amount' } } }
+  ]).toArray();
+  return result.length > 0 ? result[0].total : 0;
+}
+
 function authMiddleware(req, res, next) {
   const key = req.header('X-API-Key');
   if (key !== API_SECRET) return res.status(401).json({ success: false, error: 'Unauthorized' });
   next();
 }
 
-// Rate Limiter
 const withdrawLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 3, 
+  max: 3,
   message: { success: false, error: 'Too many requests. Wait 1 minute.' }
 });
 
-// xRocket API Helper
+// ===== xRocket API Helper (FIXED) =====
 async function callXRocketTransfer(payload) {
   try {
-    // Official xRocket App Transfer endpoint
-    const res = await axios.post(`${XROCKET_BASE_URL}/app/transfer`, payload, {
+    // ✅ FIX #1: Use full /api/v1/app/transfer path
+    const res = await axios.post(`${XROCKET_BASE_URL}/api/v1/app/transfer`, payload, {
       headers: {
         'Rocket-Pay-Key': XROCKET_API_KEY,
         'Accept': 'application/json',
@@ -88,9 +94,9 @@ async function callXRocketTransfer(payload) {
     });
     return { ok: true, data: res.data };
   } catch (err) {
-    return { 
-      ok: false, 
-      error: err.response?.data?.message || err.message 
+    return {
+      ok: false,
+      error: err.response?.data?.message || err.message
     };
   }
 }
@@ -101,13 +107,11 @@ app.get('/', (req, res) => {
   res.json({ status: 'Live', service: 'xRocket-to-xRocket Autopay', fee: `${FEE_PERCENT}%` });
 });
 
-// Get Balance
 app.get('/balance/:userId', authMiddleware, async (req, res) => {
   const balance = await getBalance(req.params.userId);
   res.json({ userId: req.params.userId, balance });
 });
 
-// Add Balance (Call this from your Game/Admin when user earns)
 app.post('/balance/:userId/add', authMiddleware, async (req, res) => {
   const { amount } = req.body;
   if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
@@ -122,7 +126,7 @@ app.post('/balance/:userId/add', authMiddleware, async (req, res) => {
   res.json({ success: true, newBalance: newBal });
 });
 
-// Withdrawal Route (The Core)
+// ===== Withdrawal Route (FIXED) =====
 app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
   const { userId, telegramId, amount, currency = 'DOGS' } = req.body;
 
@@ -136,12 +140,21 @@ app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
     return res.status(400).json({ success: false, error: 'Insufficient balance' });
   }
 
+  // 1b. Check Daily Limit
+  const alreadyToday = await dailyWithdrawn(userId);
+  if (alreadyToday + amount > DAILY_LIMIT) {
+    return res.status(400).json({
+      success: false,
+      error: `Daily limit exceeded. Limit: ${DAILY_LIMIT}, already: ${alreadyToday}`
+    });
+  }
+
   // 2. Setup Transfer Details
   const fee = (amount * FEE_PERCENT) / 100;
   const netAmount = Number((amount - fee).toFixed(2));
   const transferId = crypto.randomUUID();
 
-  // 3. Atomic Deduction (Prevents double-click cheating)
+  // 3. Atomic Deduction
   const deduct = await balances.updateOne(
     { userId: String(userId), balance: { $gte: amount } },
     { $inc: { balance: -amount }, $set: { updatedAt: Date.now() } }
@@ -159,20 +172,26 @@ app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
 
   log.info(`🚀 Attempting transfer: ${netAmount} ${currency} to ${telegramId}`);
 
-  // 5. Call xRocket Internal Transfer
+  // 5. Call xRocket — ✅ FIX #2: Use correct field names from docs
   const result = await callXRocketTransfer({
-    tgUserId: Number(telegramId),
+    toUserId: Number(telegramId),     // ✅ was wrong: tgUserId
     currency: currency,
     amount: netAmount,
     transferId: transferId,
-    description: `Payout for ${userId}`
+    description: `Watch Dog payout for ${userId}`
   });
 
   if (result.ok) {
-    // Success
     await transactions.updateOne({ transferId }, { $set: { status: 'completed', completedAt: Date.now() } });
     log.info(`✅ Transfer Success: ${transferId}`);
-    return res.json({ success: true, transferId, net: netAmount });
+    return res.json({
+      success: true,
+      transferId,
+      withdrawn: amount,
+      fee,
+      net: netAmount,
+      currency
+    });
   } else {
     // Fail & Refund
     await balances.updateOne({ userId: String(userId) }, { $inc: { balance: amount } });
@@ -184,7 +203,6 @@ app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
 
 // ===== START SERVER =====
 connectMongo().then(() => {
-  // Use 0.0.0.0 for Railway/Cloud
   app.listen(PORT, "0.0.0.0", () => {
     log.info(`🚀 Autopay running on port ${PORT}`);
   });
