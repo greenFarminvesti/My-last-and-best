@@ -14,301 +14,154 @@ const log = pino({
 
 const app = express();
 app.use(helmet());
-app.use(cors());
+app.use(cors()); // Allows your Mini App to talk to this server
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const XROCKET_API_KEY = process.env.XROCKET_API_KEY;
-const XROCKET_BASE_URL = process.env.XROCKET_BASE_URL || 'https://pay.xrocket.exchange';
+const XROCKET_BASE_URL = 'https://pay.xrocket.exchange'; // Official URL
 const FEE_PERCENT = Number(process.env.FEE_PERCENT || 40);
-const API_SECRET = process.env.API_SECRET || 'change-me-in-railway';
-const DAILY_WITHDRAW_LIMIT = Number(process.env.DAILY_WITHDRAW_LIMIT || 10000);
-const SUPPORTED_CURRENCIES = ['TONCOIN', 'DOGS', 'NOTCOIN'];
+const DAILY_WITHDRAW_LIMIT = Number(process.env.DAILY_WITHDRAW_LIMIT || 100000);
 const MONGODB_URI = process.env.MONGODB_URI;
 const MONGODB_DB = process.env.MONGODB_DB || 'watchdog_autopay';
 
-if (!XROCKET_API_KEY) {
-  log.error('❌ Missing XROCKET_API_KEY');
-  process.exit(1);
-}
-if (!MONGODB_URI) {
-  log.error('❌ Missing MONGODB_URI');
+// Security check on startup
+if (!XROCKET_API_KEY || !MONGODB_URI) {
+  log.error('❌ CRITICAL ERROR: Missing XROCKET_API_KEY or MONGODB_URI in Railway Variables');
   process.exit(1);
 }
 
-// ===== MONGODB =====
-let db;
-let balances, transactions;
+// ===== MONGODB CONNECTION =====
+let db, balances, transactions;
 
 async function connectMongo() {
-  const client = new MongoClient(MONGODB_URI);
-  await client.connect();
-  db = client.db(MONGODB_DB);
-  balances = db.collection('balances');
-  transactions = db.collection('transactions');
+  try {
+    const client = new MongoClient(MONGODB_URI);
+    await client.connect();
+    db = client.db(MONGODB_DB);
+    balances = db.collection('balances');
+    transactions = db.collection('transactions');
 
-  // Indexes for fast lookups
-  await balances.createIndex({ userId: 1 }, { unique: true });
-  await transactions.createIndex({ transferId: 1 }, { unique: true });
-  await transactions.createIndex({ userId: 1, createdAt: -1 });
-  await transactions.createIndex({ status: 1, createdAt: -1 });
-
-  log.info('🍃 MongoDB connected');
+    await balances.createIndex({ userId: 1 }, { unique: true });
+    await transactions.createIndex({ transferId: 1 }, { unique: true });
+    
+    log.info('🍃 MongoDB connected and Indexes created');
+  } catch (err) {
+    log.error('❌ MongoDB Connection Failed:', err.message);
+    process.exit(1);
+  }
 }
 
 // ===== HELPERS =====
-function generateTransferId() {
-  return `wd_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
-}
-
 async function getBalance(userId) {
   const doc = await balances.findOne({ userId });
   return doc ? doc.balance : 0;
 }
 
-async function setBalance(userId, balance) {
-  await balances.updateOne(
-    { userId },
-    { $set: { userId, balance, updatedAt: Date.now() } },
-    { upsert: true }
-  );
-}
-
-async function addToBalance(userId, amount) {
-  const current = await getBalance(userId);
-  await setBalance(userId, current + amount);
-}
-
-async function dailyWithdrawn(userId) {
-  const since = Date.now() - 24 * 60 * 60 * 1000;
-  const result = await transactions.aggregate([
-    {
-      $match: {
-        userId,
-        status: 'completed',
-        createdAt: { $gt: since }
-      }
-    },
-    { $group: { _id: null, total: { $sum: '$amount' } } }
-  ]).toArray();
-  return result.length > 0 ? result[0].total : 0;
-}
-
-async function callXRocket(endpoint, payload) {
-  try {
-    const res = await axios.post(`${XROCKET_BASE_URL}${endpoint}`, payload, {
-      headers: {
-        'Authorization': `Bearer ${XROCKET_API_KEY}`,
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-      },
-      timeout: 15000
-    });
-    return { ok: true, data: res.data };
-  } catch (err) {
-    log.error({ err: err.response?.data || err.message }, 'xRocket call failed');
-    return { ok: false, status: err.response?.status || 500, error: err.response?.data || err.message };
-  }
-}
-
-// ===== AUTH =====
-function authMiddleware(req, res, next) {
-  const key = req.header('X-API-Key');
-  if (key !== API_SECRET) {
-    return res.status(401).json({ success: false, error: 'Unauthorized' });
-  }
-  next();
-}
-
-// ===== RATE LIMIT =====
-const withdrawLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 5,
-  message: { success: false, error: 'Too many withdrawal attempts. Try again in a minute.' }
-});
-
-// ===== ROUTES =====
-
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'xrocket-instant-autopay',
-    version: '3.0.0',
-    database: 'mongodb',
-    fee: `${FEE_PERCENT}%`,
-    currencies: SUPPORTED_CURRENCIES
-  });
-});
-
-app.get('/balance/:userId', authMiddleware, async (req, res) => {
-  const balance = await getBalance(req.params.userId);
-  res.json({ userId: req.params.userId, balance });
-});
-
-app.post('/balance/:userId/add', authMiddleware, async (req, res) => {
-  const { amount } = req.body;
-  if (!amount || amount <= 0) {
-    return res.status(400).json({ success: false, error: 'Invalid amount' });
-  }
-  await addToBalance(req.params.userId, amount);
-  const newBalance = await getBalance(req.params.userId);
-  log.info({ userId: req.params.userId, amount, newBalance }, 'Balance added');
-  res.json({ success: true, newBalance });
-});
-
-app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
-  const { userId, telegramId, amount, currency = 'TONCOIN' } = req.body;
-
-  if (!userId || !telegramId || !amount) {
-    return res.status(400).json({ success: false, error: 'Missing userId, telegramId, or amount' });
-  }
-  if (typeof amount !== 'number' || amount <= 0) {
-    return res.status(400).json({ success: false, error: 'Amount must be a positive number' });
-  }
-  if (!SUPPORTED_CURRENCIES.includes(currency)) {
-    return res.status(400).json({ success: false, error: `Unsupported currency. Use: ${SUPPORTED_CURRENCIES.join(', ')}` });
-  }
-
-  const balance = await getBalance(userId);
-  if (balance < amount) {
-    return res.status(400).json({ success: false, error: `Insufficient balance. You have ${balance}, need ${amount}` });
-  }
-
-  const alreadyToday = await dailyWithdrawn(userId);
-  if (alreadyToday + amount > DAILY_WITHDRAW_LIMIT) {
-    return res.status(400).json({
-      success: false,
-      error: `Daily limit exceeded. Limit: ${DAILY_WITHDRAW_LIMIT}, already withdrawn: ${alreadyToday}`
-    });
-  }
-
-  const fee = (amount * FEE_PERCENT) / 100;
-  const netAmount = amount - fee;
-  const transferId = generateTransferId();
-
-  // Atomic balance update (prevents race conditions)
-  const updateResult = await balances.updateOne(
+// Atomic update to prevent double-spending
+async function deductBalance(userId, amount) {
+  const result = await balances.updateOne(
     { userId, balance: { $gte: amount } },
     { $inc: { balance: -amount }, $set: { updatedAt: Date.now() } }
   );
+  return result.matchedCount > 0;
+}
 
-  if (updateResult.matchedCount === 0) {
-    return res.status(400).json({ success: false, error: 'Insufficient balance (concurrent update)' });
-  }
-
-  await transactions.insertOne({
-    userId,
-    transferId,
-    telegramId,
-    amount,
-    fee,
-    net: netAmount,
-    currency,
-    status: 'pending',
-    description: `Auto-Pay to ${telegramId}`,
-    createdAt: Date.now()
-  });
-
-  log.info({ userId, amount, fee, netAmount, currency, transferId }, 'Withdrawal started');
-
-  const result = await callXRocket('/api/v1/withdrawals', {
-    tgUserId: telegramId,
-    currency: currency,
-    amount: netAmount,
-    transferId: transferId,
-    description: `Watch Dog auto-pay for ${userId}`
-  });
-
-  if (result.ok) {
-    await transactions.updateOne(
-      { transferId },
-      { $set: { status: 'completed', completedAt: Date.now() } }
-    );
-    log.info({ transferId, userId, netAmount }, '✅ Withdrawal completed');
-    return res.json({
-      success: true,
-      message: 'Withdrawal sent instantly via xRocket',
-      withdrawn: amount,
-      fee,
-      net: netAmount,
-      currency,
-      transferId
-    });
-  }
-
-  // Refund on failure
+async function refundBalance(userId, amount) {
   await balances.updateOne(
     { userId },
     { $inc: { balance: amount }, $set: { updatedAt: Date.now() } }
   );
-  await transactions.updateOne(
-    { transferId },
-    { $set: { status: 'failed', failedAt: Date.now(), error: result.error } }
-  );
+}
 
-  log.error({ transferId, err: result.error }, '❌ Withdrawal failed — refunded');
-
-  return res.status(502).json({
-    success: false,
-    error: 'Withdrawal failed. Amount refunded.',
-    details: result.error,
-    refunded: true,
-    transferId
-  });
-});
-
-app.get('/transaction/:transferId', authMiddleware, async (req, res) => {
-  const tx = await transactions.findOne({ transferId: req.params.transferId });
-  if (!tx) return res.status(404).json({ success: false, error: 'Transaction not found' });
-  res.json(tx);
-});
-
-app.get('/transactions/:userId', authMiddleware, async (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 20, 100);
-  const txs = await transactions
-    .find({ userId: req.params.userId })
-    .sort({ createdAt: -1 })
-    .limit(limit)
-    .toArray();
-  res.json({ userId: req.params.userId, count: txs.length, transactions: txs });
-});
-
-app.post('/webhook/xrocket', async (req, res) => {
-  const { transferId, status } = req.body;
-  if (!transferId || !status) {
-    return res.status(400).json({ success: false, error: 'Missing transferId or status' });
+// Official xRocket API Call logic
+async function callXRocketTransfer(tgUserId, amount, currency, transferId) {
+  try {
+    const res = await axios.post(`${XROCKET_BASE_URL}/app/transfer`, {
+      tgUserId: Number(tgUserId),
+      currency: currency,
+      amount: Number(amount),
+      transferId: transferId,
+      description: `Withdrawal for User ${tgUserId}`
+    }, {
+      headers: {
+        'Rocket-Pay-Key': XROCKET_API_KEY, // Use the correct Header
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000
+    });
+    return { ok: true, data: res.data };
+  } catch (err) {
+    return { ok: false, error: err.response?.data?.message || err.message };
   }
-  await transactions.updateOne({ transferId }, { $set: { status, updatedAt: Date.now() } });
-  log.info({ transferId, status }, 'Webhook update');
-  res.json({ success: true });
+}
+
+// ===== ROUTES =====
+
+// 1. Health Check
+app.get('/', (req, res) => {
+  res.json({ status: 'Live', service: 'xRocket Auto-Pay', fee: `${FEE_PERCENT}%` });
 });
 
-// Stats endpoint (bonus!)
-app.get('/stats', authMiddleware, async (req, res) => {
-  const totalTx = await transactions.countDocuments({ status: 'completed' });
-  const totalVolume = await transactions.aggregate([
-    { $match: { status: 'completed' } },
-    { $group: { _id: null, total: { $sum: '$amount' }, fees: { $sum: '$fee' } } }
-  ]).toArray();
-  const stats = totalVolume[0] || { total: 0, fees: 0 };
-  res.json({
-    totalTransactions: totalTx,
-    totalVolume: stats.total,
-    totalFees: stats.fees
+// 2. Withdrawal Route
+app.post('/api/withdraw', async (req, res) => {
+  const { userId, tgUserId, amount, currency = 'DOGS' } = req.body;
+
+  // Basic Validation
+  if (!userId || !tgUserId || !amount) {
+    return res.status(400).json({ success: false, error: 'Missing required fields' });
+  }
+
+  // Check Database Balance
+  const currentBalance = await getBalance(userId);
+  if (currentBalance < amount) {
+    return res.status(400).json({ success: false, error: 'Insufficient balance' });
+  }
+
+  const fee = (amount * FEE_PERCENT) / 100;
+  const netAmount = amount - fee;
+  const transferId = crypto.randomUUID();
+
+  // Try to deduct balance first (Atomic)
+  const success = await deductBalance(userId, amount);
+  if (!success) {
+    return res.status(400).json({ success: false, error: 'Balance deduction failed' });
+  }
+
+  // Create Pending Transaction record
+  await transactions.insertOne({
+    userId, transferId, tgUserId, amount, netAmount, status: 'pending', createdAt: Date.now()
   });
+
+  log.info(`🚀 Starting transfer: ${netAmount} ${currency} to TG:${tgUserId}`);
+
+  // Call xRocket
+  const result = await callXRocketTransfer(tgUserId, netAmount, currency, transferId);
+
+  if (result.ok) {
+    await transactions.updateOne({ transferId }, { $set: { status: 'completed' } });
+    log.info(`✅ Success: ${transferId}`);
+    return res.json({ success: true, transferId, net: netAmount });
+  } else {
+    // REFUND the user if xRocket fails
+    await refundBalance(userId, amount);
+    await transactions.updateOne({ transferId }, { $set: { status: 'failed', error: result.error } });
+    log.error(`❌ xRocket Failed: ${result.error} — Refunded User.`);
+    return res.status(502).json({ success: false, error: result.error, refunded: true });
+  }
 });
 
-app.use((req, res) => res.status(404).json({ success: false, error: 'Not found' }));
-
-app.use((err, req, res, next) => {
-  log.error({ err }, 'Unhandled error');
-  res.status(500).json({ success: false, error: 'Internal server error' });
+// 3. User Balance check (for frontend)
+app.get('/api/user/:userId', async (req, res) => {
+  const balance = await getBalance(req.params.userId);
+  res.json({ userId: req.params.userId, balance });
 });
 
-// ===== START =====
+// ===== START SERVER =====
 connectMongo().then(() => {
-  app.listen(PORT, () => {
-    log.info(`🚀 xRocket instant auto-pay running on port ${PORT}`);
-    log.info(`💰 Fee: ${FEE_PERCENT}% | Currencies: ${SUPPORTED_CURRENCIES.join(', ')}`);
+  // Bind to 0.0.0.0 to fix Railway SIGTERM error
+  app.listen(PORT, "0.0.0.0", () => {
+    log.info(`🚀 Server running on port ${PORT}`);
   });
 });
