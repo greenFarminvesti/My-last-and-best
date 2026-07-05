@@ -87,50 +87,62 @@ app.get("/", (req, res) => {
   res.json({ success: true, status: "Running", service: "Mini Withdraw Backend" });
 });
 
-// 2. Withdraw Route
+// 2. Withdraw Route (Updated: No walletAddress needed)
 app.post("/api/withdraw", async (req, res) => {
   try {
-    const { userId, tgUserId, walletAddress, amount } = req.body;
+    // We only get these 3 from your frontend
+    const { userId, tgUserId, amount } = req.body;
 
-    if (!userId || !tgUserId || !walletAddress || !amount) {
-      return res.status(400).json({ success: false, message: "Missing required fields" });
+    // 1. Check if all required data is present
+    if (!userId || !tgUserId || !amount) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Missing required fields: userId, tgUserId, or amount" 
+      });
     }
 
+    // 2. Find the user in your Database
     const user = await User.findOne({ userId });
 
-    if (!user || user.balance < amount) {
-      return res.status(400).json({ success: false, message: "Insufficient balance or user not found" });
+    // 3. Check if user exists and has enough money
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    // 1. Create a "processing" transaction record first
-    const transaction = await Transaction.create({
-      userId,
-      walletAddress,
-      amount,
-      status: "processing"
-    });
+    if (user.balance < amount) {
+      return res.status(400).json({ success: false, message: "Insufficient balance" });
+    }
 
-    // 2. Attempt xRocket payout
-    const payout = await sendPayout(tgUserId, amount);
+    // 4. Send the payout via xRocket
+    // (Ensure your sendPayout function is defined in your index.js)
+    const transferId = await sendPayout(tgUserId, amount);
 
-    // 3. Update User Balance
+    // 5. If xRocket call was successful, update the User's balance
     user.balance -= amount;
     user.totalWithdrawn += amount;
     await user.save();
 
-    // 4. Update Transaction with xRocket transferId
-    transaction.transferId = payout.transferId;
-    await transaction.save();
+    // 6. Create a record in your Transaction history
+    await Transaction.create({
+      userId,
+      transferId,
+      amount,
+      status: "processing"
+    });
 
+    // 7. Send success response back to the Mini App
     res.json({
       success: true,
-      message: "Withdrawal submitted",
-      transferId: payout.transferId
+      message: "Withdrawal submitted successfully",
+      transferId: transferId
     });
 
   } catch (error) {
-    console.error("Withdraw Error:", error);
-    res.status(500).json({ success: false, message: error.message });
+    console.error("Withdraw Error:", error.message);
+    res.status(500).json({
+      success: false,
+      message: error.message || "Withdrawal failed"
+    });
   }
 });
 
