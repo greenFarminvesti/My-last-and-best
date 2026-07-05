@@ -5,7 +5,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
-const Database = require('better-sqlite3');
+const { MongoClient } = require('mongodb');
 const pino = require('pino');
 
 const log = pino({
@@ -19,95 +19,82 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const XROCKET_API_KEY = process.env.XROCKET_API_KEY;
-const XROCKET_BASE_URL = process.env.XROCKET_BASE_URL || 'https://pay.testnet.xrocket.exchange';
+const XROCKET_BASE_URL = process.env.XROCKET_BASE_URL || 'https://pay.xrocket.exchange';
 const FEE_PERCENT = Number(process.env.FEE_PERCENT || 40);
 const API_SECRET = process.env.API_SECRET || 'change-me-in-railway';
-const TEST_MODE = process.env.TEST_MODE === 'true';
 const DAILY_WITHDRAW_LIMIT = Number(process.env.DAILY_WITHDRAW_LIMIT || 10000);
 const SUPPORTED_CURRENCIES = ['TONCOIN', 'DOGS', 'NOTCOIN'];
+const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_DB = process.env.MONGODB_DB || 'watchdog_autopay';
 
 if (!XROCKET_API_KEY) {
   log.error('❌ Missing XROCKET_API_KEY');
   process.exit(1);
 }
+if (!MONGODB_URI) {
+  log.error('❌ Missing MONGODB_URI');
+  process.exit(1);
+}
 
-// ===== DATABASE =====
-const db = new Database('autopay.db');
-db.pragma('journal_mode = WAL');
+// ===== MONGODB =====
+let db;
+let balances, transactions;
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS balances (
-    userId TEXT PRIMARY KEY,
-    balance REAL NOT NULL DEFAULT 0,
-    updatedAt INTEGER NOT NULL
-  );
+async function connectMongo() {
+  const client = new MongoClient(MONGODB_URI);
+  await client.connect();
+  db = client.db(MONGODB_DB);
+  balances = db.collection('balances');
+  transactions = db.collection('transactions');
 
-  CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    userId TEXT NOT NULL,
-    transferId TEXT UNIQUE NOT NULL,
-    telegramId INTEGER NOT NULL,
-    amount REAL NOT NULL,
-    fee REAL NOT NULL,
-    net REAL NOT NULL,
-    currency TEXT NOT NULL,
-    status TEXT NOT NULL,
-    description TEXT,
-    createdAt INTEGER NOT NULL
-  );
+  // Indexes for fast lookups
+  await balances.createIndex({ userId: 1 }, { unique: true });
+  await transactions.createIndex({ transferId: 1 }, { unique: true });
+  await transactions.createIndex({ userId: 1, createdAt: -1 });
+  await transactions.createIndex({ status: 1, createdAt: -1 });
 
-  CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions(userId, createdAt);
-  CREATE INDEX IF NOT EXISTS idx_tx_status ON transactions(status);
-`);
-
-const stmtGetBalance = db.prepare('SELECT balance FROM balances WHERE userId = ?');
-const stmtSetBalance = db.prepare(`
-  INSERT INTO balances (userId, balance, updatedAt) VALUES (?, ?, ?)
-  ON CONFLICT(userId) DO UPDATE SET balance = excluded.balance, updatedAt = excluded.updatedAt
-`);
-const stmtAddTx = db.prepare(`
-  INSERT INTO transactions (userId, transferId, telegramId, amount, fee, net, currency, status, description, createdAt)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-const stmtUpdateTx = db.prepare('UPDATE transactions SET status = ? WHERE transferId = ?');
-const stmtGetTx = db.prepare('SELECT * FROM transactions WHERE transferId = ?');
-const stmtListTx = db.prepare(`
-  SELECT * FROM transactions WHERE userId = ? ORDER BY createdAt DESC LIMIT ?
-`);
-const stmtDailySum = db.prepare(`
-  SELECT COALESCE(SUM(amount), 0) AS total FROM transactions
-  WHERE userId = ? AND createdAt > ? AND status = 'completed'
-`);
+  log.info('🍃 MongoDB connected');
+}
 
 // ===== HELPERS =====
 function generateTransferId() {
   return `wd_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
 }
 
-function getBalance(userId) {
-  const row = stmtGetBalance.get(userId);
-  return row ? row.balance : 0;
+async function getBalance(userId) {
+  const doc = await balances.findOne({ userId });
+  return doc ? doc.balance : 0;
 }
 
-function setBalance(userId, balance) {
-  stmtSetBalance.run(userId, balance, Date.now());
+async function setBalance(userId, balance) {
+  await balances.updateOne(
+    { userId },
+    { $set: { userId, balance, updatedAt: Date.now() } },
+    { upsert: true }
+  );
 }
 
-function addToBalance(userId, amount) {
-  const current = getBalance(userId);
-  setBalance(userId, current + amount);
+async function addToBalance(userId, amount) {
+  const current = await getBalance(userId);
+  await setBalance(userId, current + amount);
 }
 
-function dailyWithdrawn(userId) {
+async function dailyWithdrawn(userId) {
   const since = Date.now() - 24 * 60 * 60 * 1000;
-  return stmtDailySum.get(userId, since).total;
+  const result = await transactions.aggregate([
+    {
+      $match: {
+        userId,
+        status: 'completed',
+        createdAt: { $gt: since }
+      }
+    },
+    { $group: { _id: null, total: { $sum: '$amount' } } }
+  ]).toArray();
+  return result.length > 0 ? result[0].total : 0;
 }
 
 async function callXRocket(endpoint, payload) {
-  if (TEST_MODE) {
-    log.warn('🧪 TEST_MODE active — faking xRocket success');
-    return { ok: true, data: { ...payload, status: 'completed' } };
-  }
   try {
     const res = await axios.post(`${XROCKET_BASE_URL}${endpoint}`, payload, {
       headers: {
@@ -142,36 +129,33 @@ const withdrawLimiter = rateLimit({
 
 // ===== ROUTES =====
 
-// Health
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'xrocket-instant-autopay',
-    version: '2.0.0',
+    version: '3.0.0',
+    database: 'mongodb',
     fee: `${FEE_PERCENT}%`,
-    testMode: TEST_MODE,
     currencies: SUPPORTED_CURRENCIES
   });
 });
 
-// Get balance
-app.get('/balance/:userId', authMiddleware, (req, res) => {
-  res.json({ userId: req.params.userId, balance: getBalance(req.params.userId) });
+app.get('/balance/:userId', authMiddleware, async (req, res) => {
+  const balance = await getBalance(req.params.userId);
+  res.json({ userId: req.params.userId, balance });
 });
 
-// Add funds (admin / payment confirmed)
-app.post('/balance/:userId/add', authMiddleware, (req, res) => {
+app.post('/balance/:userId/add', authMiddleware, async (req, res) => {
   const { amount } = req.body;
   if (!amount || amount <= 0) {
     return res.status(400).json({ success: false, error: 'Invalid amount' });
   }
-  addToBalance(req.params.userId, amount);
-  const newBalance = getBalance(req.params.userId);
+  await addToBalance(req.params.userId, amount);
+  const newBalance = await getBalance(req.params.userId);
   log.info({ userId: req.params.userId, amount, newBalance }, 'Balance added');
   res.json({ success: true, newBalance });
 });
 
-// Instant auto-pay withdrawal
 app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
   const { userId, telegramId, amount, currency = 'TONCOIN' } = req.body;
 
@@ -185,12 +169,12 @@ app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
     return res.status(400).json({ success: false, error: `Unsupported currency. Use: ${SUPPORTED_CURRENCIES.join(', ')}` });
   }
 
-  const balance = getBalance(userId);
+  const balance = await getBalance(userId);
   if (balance < amount) {
     return res.status(400).json({ success: false, error: `Insufficient balance. You have ${balance}, need ${amount}` });
   }
 
-  const alreadyToday = dailyWithdrawn(userId);
+  const alreadyToday = await dailyWithdrawn(userId);
   if (alreadyToday + amount > DAILY_WITHDRAW_LIMIT) {
     return res.status(400).json({
       success: false,
@@ -202,11 +186,28 @@ app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
   const netAmount = amount - fee;
   const transferId = generateTransferId();
 
-  setBalance(userId, balance - amount);
-  stmtAddTx.run(
-    userId, transferId, telegramId, amount, fee, netAmount,
-    currency, 'pending', `Auto-Pay to ${telegramId}`, Date.now()
+  // Atomic balance update (prevents race conditions)
+  const updateResult = await balances.updateOne(
+    { userId, balance: { $gte: amount } },
+    { $inc: { balance: -amount }, $set: { updatedAt: Date.now() } }
   );
+
+  if (updateResult.matchedCount === 0) {
+    return res.status(400).json({ success: false, error: 'Insufficient balance (concurrent update)' });
+  }
+
+  await transactions.insertOne({
+    userId,
+    transferId,
+    telegramId,
+    amount,
+    fee,
+    net: netAmount,
+    currency,
+    status: 'pending',
+    description: `Auto-Pay to ${telegramId}`,
+    createdAt: Date.now()
+  });
 
   log.info({ userId, amount, fee, netAmount, currency, transferId }, 'Withdrawal started');
 
@@ -219,7 +220,10 @@ app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
   });
 
   if (result.ok) {
-    stmtUpdateTx.run('completed', transferId);
+    await transactions.updateOne(
+      { transferId },
+      { $set: { status: 'completed', completedAt: Date.now() } }
+    );
     log.info({ transferId, userId, netAmount }, '✅ Withdrawal completed');
     return res.json({
       success: true,
@@ -233,8 +237,14 @@ app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
   }
 
   // Refund on failure
-  setBalance(userId, getBalance(userId) + amount);
-  stmtUpdateTx.run('failed', transferId);
+  await balances.updateOne(
+    { userId },
+    { $inc: { balance: amount }, $set: { updatedAt: Date.now() } }
+  );
+  await transactions.updateOne(
+    { transferId },
+    { $set: { status: 'failed', failedAt: Date.now(), error: result.error } }
+  );
 
   log.error({ transferId, err: result.error }, '❌ Withdrawal failed — refunded');
 
@@ -247,41 +257,58 @@ app.post('/withdraw', authMiddleware, withdrawLimiter, async (req, res) => {
   });
 });
 
-// Get single transaction
-app.get('/transaction/:transferId', authMiddleware, (req, res) => {
-  const tx = stmtGetTx.get(req.params.transferId);
+app.get('/transaction/:transferId', authMiddleware, async (req, res) => {
+  const tx = await transactions.findOne({ transferId: req.params.transferId });
   if (!tx) return res.status(404).json({ success: false, error: 'Transaction not found' });
   res.json(tx);
 });
 
-// Transaction history
-app.get('/transactions/:userId', authMiddleware, (req, res) => {
+app.get('/transactions/:userId', authMiddleware, async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 20, 100);
-  const txs = stmtListTx.all(req.params.userId, limit);
+  const txs = await transactions
+    .find({ userId: req.params.userId })
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .toArray();
   res.json({ userId: req.params.userId, count: txs.length, transactions: txs });
 });
 
-// xRocket webhook (for status updates)
-app.post('/webhook/xrocket', (req, res) => {
+app.post('/webhook/xrocket', async (req, res) => {
   const { transferId, status } = req.body;
   if (!transferId || !status) {
     return res.status(400).json({ success: false, error: 'Missing transferId or status' });
   }
-  stmtUpdateTx.run(status, transferId);
+  await transactions.updateOne({ transferId }, { $set: { status, updatedAt: Date.now() } });
   log.info({ transferId, status }, 'Webhook update');
   res.json({ success: true });
 });
 
-// 404
+// Stats endpoint (bonus!)
+app.get('/stats', authMiddleware, async (req, res) => {
+  const totalTx = await transactions.countDocuments({ status: 'completed' });
+  const totalVolume = await transactions.aggregate([
+    { $match: { status: 'completed' } },
+    { $group: { _id: null, total: { $sum: '$amount' }, fees: { $sum: '$fee' } } }
+  ]).toArray();
+  const stats = totalVolume[0] || { total: 0, fees: 0 };
+  res.json({
+    totalTransactions: totalTx,
+    totalVolume: stats.total,
+    totalFees: stats.fees
+  });
+});
+
 app.use((req, res) => res.status(404).json({ success: false, error: 'Not found' }));
 
-// Error handler
 app.use((err, req, res, next) => {
   log.error({ err }, 'Unhandled error');
   res.status(500).json({ success: false, error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
-  log.info(`🚀 xRocket instant auto-pay running on port ${PORT}`);
-  log.info(`💰 Fee: ${FEE_PERCENT}% | Test mode: ${TEST_MODE} | Currencies: ${SUPPORTED_CURRENCIES.join(', ')}`);
+// ===== START =====
+connectMongo().then(() => {
+  app.listen(PORT, () => {
+    log.info(`🚀 xRocket instant auto-pay running on port ${PORT}`);
+    log.info(`💰 Fee: ${FEE_PERCENT}% | Currencies: ${SUPPORTED_CURRENCIES.join(', ')}`);
+  });
 });
