@@ -28,7 +28,7 @@ const PORT = process.env.PORT || 3000;
 
 // --- 2. STATUS PAGE ---
 app.get('/', (req, res) => {
-    res.json({ status: "Online", firebase: db ? "Connected" : "Disconnected" });
+    res.json({ status: "Online", serverTime: new Date().toISOString() });
 });
 
 // --- 3. WITHDRAWAL ROUTE ---
@@ -39,7 +39,6 @@ app.post('/withdraw', async (req, res) => {
     if (auth !== API_SECRET) return res.status(401).json({ error: "Unauthorized" });
     if (!db) return res.status(500).json({ error: "Database offline" });
 
-    // Validate inputs
     const numTgId = Number(telegramId);
     const numAmount = Number(amount);
 
@@ -47,7 +46,7 @@ app.post('/withdraw', async (req, res) => {
         return res.status(400).json({ error: "Invalid parameters" });
     }
 
-    const netAmount = Math.floor(numAmount * 0.6); // 60% Payout
+    const netAmount = Math.floor(numAmount * 0.6); 
     const uniqueTxId = `tx_${userId}_${Date.now()}`;
 
     try {
@@ -59,29 +58,30 @@ app.post('/withdraw', async (req, res) => {
         const balance = doc.data().totalBalance || 0;
         if (balance < numAmount) return res.status(400).json({ error: "Insufficient balance" });
 
-        // --- THE FIX: Official xRocket Endpoint ---
-        // We use .tg domain and /api/transfer path
-        const xrocketUrl = 'https://pay.xrocket.tg/api/transfer';
+        // --- THE DEFINITIVE FIX: App Transfer Endpoint ---
+        // Most xRocket Apps now use the v1/app/transfer path
+        const xrocketUrl = 'https://pay.xrocket.tg/v1/app/transfer';
 
         const payload = {
             tgUserId: numTgId,
             currency: 'DOGS',
             amount: netAmount,
             transferId: uniqueTxId,
-            description: "Payout from App"
+            description: "App Payout"
         };
 
-        console.log(`📤 Sending Payout to ${numTgId} via ${xrocketUrl}`);
+        console.log(`📤 Sending Request to: ${xrocketUrl}`);
 
         const response = await axios.post(xrocketUrl, payload, {
             headers: { 
                 'Rocket-Pay-Key': XROCKET_API_KEY,
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
             },
             timeout: 10000
         });
 
-        if (response.data && (response.data.success || response.data.data)) {
+        if (response.data && response.data.success) {
             await userRef.update({
                 totalBalance: admin.firestore.FieldValue.increment(-numAmount),
                 totalWithdrawn: admin.firestore.FieldValue.increment(numAmount)
@@ -93,14 +93,23 @@ app.post('/withdraw', async (req, res) => {
         }
 
     } catch (err) {
-        console.error("❌ API ERROR:", err.response?.data || err.message);
+        console.error("❌ XROCKET ERROR LOG:");
         
-        // Return the specific error from xRocket
-        return res.status(err.response?.status || 500).json({
-            success: false,
-            message: "xRocket Error",
-            details: err.response?.data || err.message
-        });
+        // Log the exact URL that failed to help debug
+        if (err.response) {
+            console.error("URL Attempted:", err.config.url);
+            console.error("Status Code:", err.response.status);
+            console.error("Response Data:", JSON.stringify(err.response.data, null, 2));
+
+            return res.status(err.response.status).json({
+                success: false,
+                error: "xRocket Rejected Request",
+                details: err.response.data
+            });
+        }
+        
+        console.error("Message:", err.message);
+        return res.status(500).json({ success: false, error: err.message });
     }
 });
 
