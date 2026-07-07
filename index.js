@@ -35,7 +35,7 @@ app.get('/', (req, res) => {
     });
 });
 
-// --- 3. THE WITHDRAWAL ROUTE (FIXED) ---
+// --- 3. THE WITHDRAWAL ROUTE ---
 app.post('/withdraw', async (req, res) => {
     const { userId, telegramId, amount } = req.body;
     const auth = req.header('X-API-Key');
@@ -56,6 +56,10 @@ app.post('/withdraw', async (req, res) => {
         });
     }
 
+    // Define unique ID outside try block so catch can access it
+    const uniqueTxId = `wd_${userId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const netAmount = Math.floor(amount * 0.6); // 60% payout
+
     try {
         const userRef = db.collection('users').doc(String(userId));
         const doc = await userRef.get();
@@ -67,28 +71,16 @@ app.post('/withdraw', async (req, res) => {
         const balance = doc.data().totalBalance || 0;
         if (balance < amount) {
             return res.status(400).json({ 
-                error: "Insufficient balance in App",
+                error: "Insufficient balance",
                 balance: balance,
                 requested: amount
             });
         }
 
-        // Calculate 60% for user (40% fee)
-        const netAmount = Math.floor(amount * 0.6); // Ensure it's an integer
-        
-        // IMPORTANT: xRocket might expect amount in the smallest unit
-        // If DOGS has decimals, use netAmount directly
-        // If DOGS is like TON (with 9 decimals), multiply by 10^9
-        const amountToSend = netAmount; // Adjust this based on xRocket's requirements
-
-        // Generate unique transaction ID
-        const uniqueTxId = `wd_${userId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-        // --- FIXED: xRocket API Call with correct format ---
         const requestBody = {
             tgUserId: Number(telegramId),
             currency: 'DOGS',
-            amount: amountToSend,
+            amount: netAmount,
             transferId: uniqueTxId,
             description: "Watch Reward Payout"
         };
@@ -108,17 +100,13 @@ app.post('/withdraw', async (req, res) => {
             }
         );
 
-        console.log('📥 xRocket Response:', response.data);
-
         // Check for success
         if (response.data && response.data.success === true) {
-            // 1. Deduct balance from user
             await userRef.update({
                 totalBalance: admin.firestore.FieldValue.increment(-amount),
                 totalWithdrawn: admin.firestore.FieldValue.increment(amount)
             });
 
-            // 2. Save to history
             await db.collection('withdrawals').add({
                 userId: String(userId),
                 telegramId: Number(telegramId),
@@ -136,75 +124,40 @@ app.post('/withdraw', async (req, res) => {
                 amount: netAmount
             });
         } else {
-            const errorMsg = response.data?.error?.message || 
-                           response.data?.message || 
-                           'Transfer rejected by xRocket';
-            
-            console.error('❌ xRocket Rejection:', response.data);
-            
-            await db.collection('withdrawals').add({
-                userId: String(userId),
-                telegramId: Number(telegramId),
-                amount: amount,
-                status: 'failed',
-                error: errorMsg,
-                date: admin.firestore.FieldValue.serverTimestamp()
-            }).catch(() => {});
-
-            return res.status(400).json({ 
-                success: false, 
-                error: errorMsg,
-                details: response.data 
-            });
+            throw new Error(response.data?.message || 'Transfer rejected by xRocket');
         }
 
     } catch (err) {
-        console.error('❌ XROCKET ERROR:');
-        console.error('Status:', err.response?.status);
-        console.error('Data:', JSON.stringify(err.response?.data, null, 2));
-        console.error('Message:', err.message);
+        console.error('❌ ERROR OCCURRED:');
+        const errorDetail = err.response?.data?.error?.message || err.response?.data?.message || err.message;
         
-        // Check if it's a validation error
-        if (err.response?.status === 400) {
-            const errorDetail = err.response?.data?.error?.message || 
-                               err.response?.data?.message || 
-                               'Bad request - check parameters';
-            
-            console.error('Bad Request Details:', errorDetail);
-            
-            // Log to database
-            if (db && userId) {
-                try {
-                    await db.collection('withdrawals').add({
-                        userId: String(userId),
-                        telegramId: Number(telegramId),
-                        amount: amount || 0,
-                        status: 'failed',
-                        error: errorDetail,
-                        date: admin.firestore.FieldValue.serverTimestamp()
-                    });
-                } catch (dbErr) {
-                    console.error('Failed to log to database:', dbErr.message);
-                }
+        console.error('Details:', errorDetail);
+        
+        // Log failure to database
+        if (db && userId) {
+            try {
+                await db.collection('withdrawals').add({
+                    userId: String(userId),
+                    telegramId: Number(telegramId),
+                    amount: amount || 0,
+                    status: 'failed',
+                    error: errorDetail,
+                    date: admin.firestore.FieldValue.serverTimestamp()
+                });
+            } catch (dbErr) {
+                console.error('Failed to log error to DB:', dbErr.message);
             }
-            
-            return res.status(400).json({
-                success: false,
-                error: errorDetail,
-                return res.status(400).json({
-    success: false,
-    error: errorDetail,
-    sentData: {
-        tgUserId: Number(telegramId),
-        currency: "DOGS",
-        amount: Math.floor(amount * 0.6),
-        transferId: uniqueTxId
-    }
-});
+        }
 
-        res.status(500).json({ 
+        return res.status(err.response?.status || 500).json({ 
             success: false, 
-            error: "Internal server error: " + err.message 
+            error: errorDetail,
+            sentData: {
+                tgUserId: Number(telegramId),
+                currency: "DOGS",
+                amount: netAmount,
+                transferId: uniqueTxId
+            }
         });
     }
 });
