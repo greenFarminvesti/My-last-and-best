@@ -29,19 +29,17 @@ const PORT = process.env.PORT || 3000;
 // --- 2. STATUS PAGE ---
 app.get('/', (req, res) => {
     res.json({ 
-        status: "Server is Running", 
+        status: "Running", 
         firebase: db ? "Connected" : "Disconnected",
         xrocket: XROCKET_API_KEY ? "Key Present" : "Key Missing"
     });
 });
 
 // --- 3. THE WITHDRAWAL ROUTE ---
-// Ensure you send your request to: http://your-domain.com/withdraw
+// IMPORTANT: Send your request to: http://your-domain.com/withdraw
 app.post('/withdraw', async (req, res) => {
     const { userId, telegramId, amount } = req.body;
     const auth = req.header('X-API-Key');
-
-    console.log(`Incoming request for User: ${userId}, Amount: ${amount}`);
 
     // Security Check
     if (auth !== API_SECRET) {
@@ -52,93 +50,112 @@ app.post('/withdraw', async (req, res) => {
         return res.status(500).json({ success: false, error: "Database Connection Failed" });
     }
 
-    // Validation
-    if (!userId || !telegramId || !amount || amount <= 0) {
-        return res.status(400).json({ success: false, error: "Invalid Input Parameters" });
+    // Validation - Ensure data is present and amount is a number
+    if (!userId || !telegramId || !amount || isNaN(amount) || amount <= 0) {
+        return res.status(400).json({ success: false, error: "Invalid Input: Missing or zero values" });
     }
 
-    const netAmount = Math.floor(amount * 0.6); // 60% payout
+    const netAmount = Math.floor(Number(amount) * 0.6); // 60% Payout
     const uniqueTxId = `wd_${userId}_${Date.now()}`;
 
     try {
-        // 1. Firebase Check
+        // 1. Firebase Balance Check
         const userRef = db.collection('users').doc(String(userId));
         const doc = await userRef.get();
         
         if (!doc.exists) {
-            return res.status(404).json({ success: false, error: "User not found in DB" });
+            return res.status(404).json({ success: false, error: "User not found in Firebase" });
         }
 
         const balance = doc.data().totalBalance || 0;
         if (balance < amount) {
-            return res.status(400).json({ success: false, error: "Insufficient App Balance" });
+            return res.status(400).json({ success: false, error: "Insufficient user balance" });
         }
 
-        // 2. xRocket API Call
+        // 2. xRocket API Call using the specific URL you provided
+        // Combined URL: https://pay.xrocket.exchange/api/app/transfer
         const requestBody = {
-            tgUserId: Number(telegramId),
+            tgUserId: Number(telegramId), // MUST be a number
             currency: 'DOGS',
-            amount: netAmount,
+            amount: netAmount,            // MUST be a number
             transferId: uniqueTxId,
-            description: "Reward Payout"
+            description: "App Withdrawal Payout"
         };
 
-        console.log('Sending to xRocket:', requestBody);
+        console.log('📤 Outgoing Request to xRocket:', requestBody);
 
         const response = await axios.post(
-            'https://pay.xrocket.tg/api/transfer', // If this fails, try 'https://pay.xrocket.tg/app/transfer'
+            'https://pay.xrocket.exchange/api/app/transfer',
             requestBody,
             {
                 headers: { 
                     'Rocket-Pay-Key': XROCKET_API_KEY,
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
                 },
-                timeout: 10000
+                timeout: 15000
             }
         );
 
-        // 3. Check xRocket Response
+        // 3. Handle xRocket Response
+        // xRocket Pay usually returns { success: true, data: { ... } }
         if (response.data && response.data.success) {
-            // Deduct from Firebase
+            // Update User Balance in Firebase
             await userRef.update({
                 totalBalance: admin.firestore.FieldValue.increment(-amount),
                 totalWithdrawn: admin.firestore.FieldValue.increment(amount)
             });
 
-            // Log Transaction
+            // Log Transaction in History
             await db.collection('withdrawals').add({
                 userId: String(userId),
                 telegramId: Number(telegramId),
-                amount: amount,
-                netAmount: netAmount,
+                amountSent: amount,
+                netReceived: netAmount,
                 status: 'success',
                 transferId: uniqueTxId,
-                date: admin.firestore.FieldValue.serverTimestamp()
+                timestamp: admin.firestore.FieldValue.serverTimestamp()
             });
 
-            return res.json({ success: true, message: "Payout Sent!", transferId: uniqueTxId });
+            return res.json({ 
+                success: true, 
+                message: "Payout successful", 
+                transferId: uniqueTxId 
+            });
         } else {
-            console.error('xRocket logic failure:', response.data);
-            return res.status(400).json({ success: false, error: response.data.message || "xRocket Rejected Transfer" });
+            console.error('❌ xRocket Logic Error:', response.data);
+            return res.status(400).json({ 
+                success: false, 
+                error: response.data.message || "xRocket rejected transfer" 
+            });
         }
 
     } catch (err) {
-        console.error('--- ERROR LOG ---');
-        console.error('Status:', err.response?.status);
-        console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+        console.error('--- ERROR DEBUG LOG ---');
         
-        const errorDetail = err.response?.data?.message || err.message;
-
-        return res.status(err.response?.status || 500).json({
-            success: false,
-            error: errorDetail,
-            step: "Final Catch Block"
-        });
+        if (err.response) {
+            // The API responded with a status code outside of 2xx
+            console.error('xRocket Error Data:', JSON.stringify(err.response.data, null, 2));
+            console.error('Status:', err.response.status);
+            
+            return res.status(err.response.status).json({
+                success: false,
+                error: err.response.data.message || "Bad Request from xRocket",
+                details: err.response.data
+            });
+        } else {
+            // Something happened in setting up the request
+            console.error('Connection Error:', err.message);
+            return res.status(500).json({
+                success: false,
+                error: "Internal Server Error or Connection Timeout"
+            });
+        }
     }
 });
 
 // --- 4. START THE SERVER ---
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Server listening on port ${PORT}`);
-    console.log(`📍 Endpoint available at: POST http://localhost:${PORT}/withdraw`);
+    console.log(`🚀 Server active on port ${PORT}`);
+    console.log(`📡 Local Access: http://localhost:${PORT}/withdraw`);
 });
