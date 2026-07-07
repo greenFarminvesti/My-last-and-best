@@ -40,84 +40,47 @@ app.post('/withdraw', async (req, res) => {
     const { userId, telegramId, amount } = req.body;
     const auth = req.header('X-API-Key');
 
-    // Security Check
     if (auth !== API_SECRET) return res.status(401).json({ error: "Unauthorized" });
-    if (!db) return res.status(500).json({ error: "Firebase not connected" });
 
     try {
         const userRef = db.collection('users').doc(String(userId));
         const doc = await userRef.get();
-
         if (!doc.exists) return res.status(404).json({ error: "User not found" });
 
-        const balance = doc.data().totalBalance || 0; 
-        if (balance < amount) {
-            return res.status(400).json({ error: "Insufficient balance in App" });
-        }
+        const balance = doc.data().totalBalance || 0;
+        if (balance < amount) return res.status(400).json({ error: "Insufficient balance" });
 
-        // Calculate 40% fee (User gets 60%)
+        // Calculate 60% for user (40% fee)
         const netAmount = Number((amount * 0.6).toFixed(2));
 
-        // UNIQUE TRANSFER ID - Prevents "Bad Request" collisions
-        const uniqueTransferId = `wd_${userId}_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+        // UNIQUE ID
+        const uniqueTxId = `wd_${userId}_${Date.now()}`;
 
-        // Call xRocket
         const response = await axios.post('https://pay.xrocket.tg/app/transfer', {
             tgUserId: Number(telegramId),
             currency: 'DOGS',
             amount: netAmount,
-            transferId: uniqueTransferId,
-            description: `Withdrawal for User ${userId}`
+            transferId: uniqueTxId,
+            description: `Payout for ${userId}`
         }, {
-            headers: { 
-                'Rocket-Pay-Key': XROCKET_API_KEY,
-                'Content-Type': 'application/json'
-            }
+            headers: { 'Rocket-Pay-Key': XROCKET_API_KEY }
         });
 
-        // If xRocket returns success
         if (response.data && response.data.success) {
             await userRef.update({
-                totalBalance: admin.firestore.FieldValue.increment(-amount),
-                todayWithdrawals: admin.firestore.FieldValue.increment(1),
-                lastWithdrawalDate: admin.firestore.FieldValue.serverTimestamp()
+                totalBalance: admin.firestore.FieldValue.increment(-amount)
             });
-
-            await db.collection('withdrawals').add({
-                userId: String(userId),
-                telegramId: Number(telegramId),
-                amount: amount,
-                fee: amount * 0.4,
-                receivingAmount: netAmount,
-                status: 'paid',
-                date: admin.firestore.FieldValue.serverTimestamp(),
-                transferId: response.data.data?.transferId || uniqueTransferId
-            });
-
-            return res.json({ success: true, transferId: response.data.data?.transferId });
+            return res.json({ success: true });
         } else {
-            return res.status(400).json({ error: response.data.error?.message || "xRocket Rejection" });
+            // Return the SPECIFIC error from xRocket to the user
+            const xRocketError = response.data.error?.message || "Transfer Rejected";
+            return res.status(400).json({ success: false, error: xRocketError });
         }
 
     } catch (err) {
-        console.error("XROCKET ERROR DEBUG:", err.response?.data || err.message);
-        const errorMessage = err.response?.data?.error?.message || err.message;
-        
-        if (db) {
-            await db.collection('withdrawals').add({
-                userId: String(userId || "unknown"),
-                amount: amount || 0,
-                status: 'failed',
-                error: errorMessage,
-                date: admin.firestore.FieldValue.serverTimestamp()
-            }).catch(()=>{});
-        }
-
-        res.status(500).json({ success: false, error: errorMessage });
+        // This catches the 400 error and reads the response body
+        console.error("XROCKET 400 ERROR:", err.response?.data);
+        const detail = err.response?.data?.error?.message || err.message;
+        res.status(400).json({ success: false, error: detail });
     }
-});
-
-// --- 4. START SERVER ---
-app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Server listening on port ${PORT}`);
 });
