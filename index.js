@@ -26,28 +26,40 @@ const XROCKET_API_KEY = process.env.XROCKET_API_KEY;
 const API_SECRET = process.env.API_SECRET;
 const PORT = process.env.PORT || 3000;
 
-app.get('/', (req, res) => res.json({ status: "Online", currency: "DOGS" }));
+// URL from your documentation fix
+const XROCKET_BASE_URL = 'https://pay.api.xrocket.exchange/api/v1';
 
-// --- 2. THE WITHDRAWAL ROUTE ---
+app.get('/', (req, res) => res.json({ status: "Online" }));
+
+// --- DEBUG ROUTE: Check your actual DOGS balance ---
+// Open this in your browser: your-app-url.up.railway.app/check-balance
+app.get('/check-balance', async (req, res) => {
+    try {
+        const response = await axios.get(`${XROCKET_BASE_URL}/app/info`, {
+            headers: { 'Rocket-Pay-Key': XROCKET_API_KEY }
+        });
+        // This will show you exactly how many DOGS the API sees in your App
+        res.json(response.data);
+    } catch (err) {
+        res.status(500).json({ error: err.message, details: err.response?.data });
+    }
+});
+
+// --- 3. THE WITHDRAWAL ROUTE ---
 app.post('/withdraw', async (req, res) => {
     const { userId, telegramId, amount } = req.body;
-    const authHeader = req.header('X-API-Key');
+    const auth = req.header('X-API-Key');
 
-    // 1. Security Check
-    if (authHeader !== API_SECRET) {
-        return res.status(401).json({ success: false, error: "Unauthorized" });
-    }
+    if (auth !== API_SECRET) return res.status(401).json({ success: false, error: "Unauthorized" });
 
-    // 2. Data Validation
     const numTgId = Number(telegramId);
     const numAmount = Number(amount);
 
-    if (!userId || !numTgId || isNaN(numAmount) || numAmount <= 0) {
-        return res.status(400).json({ success: false, error: "Invalid input parameters" });
+    if (!userId || !numTgId || !numAmount || numAmount <= 0) {
+        return res.status(400).json({ success: false, error: "Invalid parameters" });
     }
 
-    // 3. Calculate payout (60% to user)
-    // DOGS does not support many decimals. We use Math.floor to be safe.
+    // User gets 60%
     const netAmount = Math.floor(numAmount * 0.6); 
     const uniqueTxId = `tx_${userId}_${Date.now()}`;
 
@@ -56,70 +68,54 @@ app.post('/withdraw', async (req, res) => {
         const doc = await userRef.get();
         
         if (!doc.exists) return res.status(404).json({ success: false, error: "User not found" });
+        if ((doc.data().totalBalance || 0) < numAmount) return res.status(400).json({ success: false, error: "Insufficient user balance" });
 
-        const currentBalance = doc.data().totalBalance || 0;
-        if (currentBalance < numAmount) {
-            return res.status(400).json({ success: false, error: "Insufficient user balance" });
-        }
-
-        // --- xROCKET v1 API CALL ---
-        const xrocketUrl = 'https://pay.api.xrocket.exchange/api/v1/app/transfer';
+        // Correct Endpoint for v1
+        const xrocketUrl = `${XROCKET_BASE_URL}/app/transfer`;
 
         const payload = {
             tgUserId: numTgId,
-            currency: 'DOGS',
+            currency: 'DOGS', // Ensure this is exactly 'DOGS'
             amount: netAmount,
-            transferId: uniqueTxId, // Prevents double-spending
-            description: "DOGS Payout"
+            transferId: uniqueTxId,
+            description: "DOGS Reward Payout"
         };
 
-        console.log(`📤 Sending ${netAmount} DOGS to TG ID ${numTgId}...`);
+        console.log(`📤 Attempting to send ${netAmount} DOGS to ${numTgId}`);
 
         const response = await axios.post(xrocketUrl, payload, {
             headers: { 
-                'Rocket-Pay-Key': XROCKET_API_KEY, // Main header
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
+                'Rocket-Pay-Key': XROCKET_API_KEY,
+                'Content-Type': 'application/json'
             }
         });
 
-        // --- 4. SUCCESS: Update Firestore ---
         if (response.data && response.data.success) {
             await userRef.update({
                 totalBalance: admin.firestore.FieldValue.increment(-numAmount),
                 totalWithdrawn: admin.firestore.FieldValue.increment(numAmount)
             });
-
-            console.log(`✅ Success! TxID: ${uniqueTxId}`);
-            
-            return res.status(200).json({ 
-                success: true, 
-                amountSent: netAmount,
-                transfer: response.data.data 
-            });
+            return res.json({ success: true, transfer: response.data.data });
         } else {
-            throw new Error(response.data?.message || "Transfer failed");
+            throw new Error(response.data?.message || "xRocket Error");
         }
 
     } catch (err) {
-        console.error("❌ XROCKET v1 API ERROR:");
+        console.error("❌ XROCKET API ERROR:");
         
         if (err.response) {
-            // This captures the 400 error (like "Insufficient Balance")
-            console.error("Data:", JSON.stringify(err.response.data, null, 2));
+            console.error("Status:", err.response.status);
+            console.error("Body:", JSON.stringify(err.response.data, null, 2));
+
             return res.status(err.response.status).json({
                 success: false,
                 error: "xRocket Error",
-                message: err.response.data.message || "Unknown xRocket error",
-                errors: err.response.data.errors
+                details: err.response.data // This will tell you if it's still saying "0 balance"
             });
         }
         
-        console.error(err.message);
         return res.status(500).json({ success: false, error: err.message });
     }
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 v1 DOGS Payout Server online on port ${PORT}`);
-});
+app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server on port ${PORT}`));
