@@ -191,14 +191,16 @@ app.post('/withdraw', async (req, res) => {
             return res.status(400).json({
                 success: false,
                 error: errorDetail,
-                sentData: {
-                    tgUserId: Number(telegramId),
-                    currency: 'DOGS',
-                    amount: Math.floor(amount * 0.6),
-                    transferId: `wd_${userId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-                }
-            });
-        }
+                return res.status(400).json({
+    success: false,
+    error: errorDetail,
+    sentData: {
+        tgUserId: Number(telegramId),
+        currency: "DOGS",
+        amount: Math.floor(amount * 0.6),
+        transferId: uniqueTxId
+    }
+});
 
         res.status(500).json({ 
             success: false, 
