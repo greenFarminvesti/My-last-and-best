@@ -26,45 +26,52 @@ const XROCKET_API_KEY = process.env.XROCKET_API_KEY;
 const API_SECRET = process.env.API_SECRET;
 const PORT = process.env.PORT || 3000;
 
-app.get('/', (req, res) => res.json({ status: "Online" }));
+app.get('/', (req, res) => res.json({ status: "Online", service: "Withdrawal API" }));
 
-// --- 3. WITHDRAWAL ROUTE ---
+// --- 3. THE WITHDRAWAL ROUTE ---
 app.post('/withdraw', async (req, res) => {
     const { userId, telegramId, amount } = req.body;
     const auth = req.header('X-API-Key');
 
-    if (auth !== API_SECRET) return res.status(401).json({ error: "Unauthorized" });
-    
-    // Convert to numbers
+    // Security
+    if (auth !== API_SECRET) return res.status(401).json({ success: false, error: "Unauthorized" });
+    if (!db) return res.status(500).json({ success: false, error: "Database offline" });
+
+    // Formatting
     const numTgId = Number(telegramId);
     const numAmount = Number(amount);
 
     if (!userId || !numTgId || !numAmount || numAmount <= 0) {
-        return res.status(400).json({ error: "Invalid input parameters" });
+        return res.status(400).json({ success: false, error: "Invalid parameters" });
     }
 
-    const netAmount = Math.floor(numAmount * 0.6); 
+    const netAmount = Math.floor(numAmount * 0.6); // 60% payout
     const uniqueTxId = `tx_${userId}_${Date.now()}`;
 
     try {
+        // 1. Check User in Firebase
         const userRef = db.collection('users').doc(String(userId));
         const doc = await userRef.get();
         
-        if (!doc.exists) return res.status(404).json({ error: "User not found" });
-        if ((doc.data().totalBalance || 0) < numAmount) return res.status(400).json({ error: "Insufficient balance" });
+        if (!doc.exists) return res.status(404).json({ success: false, error: "User not found" });
+        if ((doc.data().totalBalance || 0) < numAmount) {
+            return res.status(400).json({ success: false, error: "Insufficient balance" });
+        }
 
         // --- THE OFFICIAL ENDPOINT FIX ---
-        const xrocketUrl = 'https://pay.xrocket.tg/v1/transfer';
+        // Domain: pay.xrocket.tg | Path: /api/transfer
+        const xrocketUrl = 'https://pay.xrocket.tg/api/transfer';
 
         const payload = {
-            userId: numTgId,      // Rocket Pay uses 'userId', not 'tgUserId'
+            tgUserId: numTgId,   // Field name must be tgUserId
             currency: 'DOGS',
             amount: netAmount,
             transferId: uniqueTxId,
-            description: "Payout"
+            description: "App Reward Payout"
         };
 
-        console.log(`📤 Sending Request to: ${xrocketUrl}`);
+        console.log(`📤 POSTing to: ${xrocketUrl}`);
+        console.log(`📦 Payload:`, payload);
 
         const response = await axios.post(xrocketUrl, payload, {
             headers: { 
@@ -73,33 +80,42 @@ app.post('/withdraw', async (req, res) => {
             }
         });
 
+        // 2. Success Logic
         if (response.data && response.data.success) {
             await userRef.update({
                 totalBalance: admin.firestore.FieldValue.increment(-numAmount),
                 totalWithdrawn: admin.firestore.FieldValue.increment(numAmount)
             });
-            return res.json({ success: true, transferId: uniqueTxId });
+
+            return res.json({ 
+                success: true, 
+                message: "Payout successful", 
+                transferId: uniqueTxId 
+            });
         } else {
-            throw new Error(response.data?.message || "Transfer failed");
+            throw new Error(response.data?.message || "xRocket internal failure");
         }
 
     } catch (err) {
         console.error("❌ XROCKET ERROR LOG:");
         
         if (err.response) {
-            // Log the error for you to see in Railway
+            // This catches 400, 404, 500 errors from the server
             console.error("Status:", err.response.status);
-            console.error("Data:", JSON.stringify(err.response.data, null, 2));
+            console.error("Response Body:", JSON.stringify(err.response.data, null, 2));
 
             return res.status(err.response.status).json({
                 success: false,
-                error: err.response.data?.error?.message || err.response.data?.message || "xRocket Error",
-                code: err.response.data?.error?.code || "UNKNOWN_ERROR"
+                error: "xRocket API Error",
+                details: err.response.data // Look here for the specific reason!
             });
         }
         
+        console.error("System Error:", err.message);
         return res.status(500).json({ success: false, error: err.message });
     }
 });
 
-app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`🚀 Server listening on port ${PORT}`);
+});
