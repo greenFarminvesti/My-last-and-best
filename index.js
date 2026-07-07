@@ -11,6 +11,9 @@ app.use(express.json());
 // --- 1. FIREBASE ADMIN INIT ---
 try {
     if (!admin.apps.length) {
+        if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+            throw new Error("Missing FIREBASE_SERVICE_ACCOUNT in .env");
+        }
         const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount)
@@ -40,129 +43,130 @@ app.post('/withdraw', async (req, res) => {
     const { userId, telegramId, amount } = req.body;
     const auth = req.header('X-API-Key');
 
-    // Security Check
+    // Security Checks
     if (auth !== API_SECRET) {
-        return res.status(401).json({ error: "Unauthorized" });
+        return res.status(401).json({ success: false, error: "Unauthorized" });
     }
     if (!db) {
-        return res.status(500).json({ error: "Database not connected" });
+        return res.status(500).json({ success: false, error: "Database not connected" });
     }
 
-    // Validate inputs
-    if (!userId || !telegramId || !amount || amount <= 0) {
+    // Validate Input Types
+    if (!userId || !telegramId || !amount || isNaN(amount) || amount <= 0) {
         return res.status(400).json({ 
-            error: "Missing or invalid parameters",
-            required: { userId: "string", telegramId: "number", amount: "number > 0" }
+            success: false, 
+            error: "Invalid parameters. Ensure amount is a number and IDs are provided." 
         });
     }
 
-    // Define unique ID outside try block so catch can access it
-    const uniqueTxId = `wd_${userId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const netAmount = Math.floor(amount * 0.6); // 60% payout
+    // Prepare variables
+    const netAmount = Math.floor(Number(amount) * 0.6); // 60% payout
+    const uniqueTxId = `wd_${userId}_${Date.now()}`;
 
     try {
+        // 1. Check User in Firebase
         const userRef = db.collection('users').doc(String(userId));
         const doc = await userRef.get();
         
         if (!doc.exists) {
-            return res.status(404).json({ error: "User not found" });
+            return res.status(404).json({ success: false, error: "User not found in database" });
         }
 
         const balance = doc.data().totalBalance || 0;
         if (balance < amount) {
             return res.status(400).json({ 
-                error: "Insufficient balance",
-                balance: balance,
+                success: false, 
+                error: "Insufficient balance in app",
+                userBalance: balance,
                 requested: amount
             });
         }
 
+        // 2. Call xRocket API
+        // NOTE: We use /api/transfer as it is the standard for business-to-user transfers
         const requestBody = {
-            tgUserId: Number(telegramId),
+            tgUserId: Number(telegramId), 
             currency: 'DOGS',
-            amount: netAmount,
+            amount: netAmount, 
             transferId: uniqueTxId,
-            description: "Watch Reward Payout"
+            description: "Reward Payout"
         };
 
-        console.log('📤 Sending to xRocket:', JSON.stringify(requestBody, null, 2));
+        console.log('📤 Outgoing Request:', requestBody);
 
         const response = await axios.post(
-            'https://pay.xrocket.tg/app/transfer',
+            'https://pay.xrocket.tg/api/transfer',
             requestBody,
             {
                 headers: { 
                     'Rocket-Pay-Key': XROCKET_API_KEY,
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json'
+                    'Content-Type': 'application/json'
                 },
-                timeout: 10000
+                timeout: 15000
             }
         );
 
-        // Check for success
-        if (response.data && response.data.success === true) {
+        // 3. Handle xRocket Success
+        if (response.data && response.data.success) {
+            // Deduct balance from Firebase
             await userRef.update({
                 totalBalance: admin.firestore.FieldValue.increment(-amount),
                 totalWithdrawn: admin.firestore.FieldValue.increment(amount)
             });
 
+            // Log successful withdrawal
             await db.collection('withdrawals').add({
                 userId: String(userId),
                 telegramId: Number(telegramId),
                 amount: amount,
-                receivingAmount: netAmount,
-                status: 'paid',
-                date: admin.firestore.FieldValue.serverTimestamp(),
-                transferId: response.data.data?.transferId || uniqueTxId
+                netAmount: netAmount,
+                status: 'success',
+                transferId: uniqueTxId,
+                timestamp: admin.firestore.FieldValue.serverTimestamp()
             });
 
             return res.json({ 
                 success: true, 
-                message: "Withdrawal successful",
-                transferId: response.data.data?.transferId || uniqueTxId,
-                amount: netAmount
+                message: "Transfer completed", 
+                transferId: uniqueTxId,
+                sentAmount: netAmount 
             });
         } else {
-            throw new Error(response.data?.message || 'Transfer rejected by xRocket');
+            throw new Error(response.data?.message || "Unknown xRocket Error");
         }
 
     } catch (err) {
-        console.error('❌ ERROR OCCURRED:');
-        const errorDetail = err.response?.data?.error?.message || err.response?.data?.message || err.message;
+        // --- ADVANCED ERROR LOGGING ---
+        const errorData = err.response?.data;
+        const errorMsg = errorData?.message || errorData?.error || err.message;
         
-        console.error('Details:', errorDetail);
-        
-        // Log failure to database
+        console.error('❌ WITHDRAWAL FAILED:');
+        console.error('Status Code:', err.response?.status);
+        console.error('Full Error Response:', JSON.stringify(errorData, null, 2));
+
+        // Log failure to Firebase for your own records
         if (db && userId) {
-            try {
-                await db.collection('withdrawals').add({
-                    userId: String(userId),
-                    telegramId: Number(telegramId),
-                    amount: amount || 0,
-                    status: 'failed',
-                    error: errorDetail,
-                    date: admin.firestore.FieldValue.serverTimestamp()
-                });
-            } catch (dbErr) {
-                console.error('Failed to log error to DB:', dbErr.message);
-            }
+            await db.collection('withdrawals').add({
+                userId: String(userId),
+                telegramId: Number(telegramId),
+                amount: amount,
+                status: 'failed',
+                error: errorMsg,
+                timestamp: admin.firestore.FieldValue.serverTimestamp()
+            }).catch(() => {});
         }
 
-        return res.status(err.response?.status || 500).json({ 
-            success: false, 
-            error: errorDetail,
-            sentData: {
-                tgUserId: Number(telegramId),
-                currency: "DOGS",
-                amount: netAmount,
-                transferId: uniqueTxId
-            }
+        // Return detailed error to help you fix "Bad Request"
+        return res.status(err.response?.status || 500).json({
+            success: false,
+            error: errorMsg,
+            reason: errorData?.code || "API_ERROR",
+            suggestion: "Check if your xRocket App has enough DOGS balance and if the API Key has transfer permissions."
         });
     }
 });
 
 // --- 4. START THE SERVER ---
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Server listening on port ${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });
