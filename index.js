@@ -55,19 +55,18 @@ app.post('/withdraw', async (req, res) => {
         // Calculate 60% for user (40% fee)
         const netAmount = Number((amount * 0.6).toFixed(2));
 
-        // UNIQUE ID (Prevents "Bad Request" collisions)
-        const uniqueTxId = `wd_${userId}_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+        // Inside Railway index.js
+const uniqueTxId = `wd_${userId}_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
 
-        // Call xRocket
-        const response = await axios.post('https://pay.xrocket.tg/app/transfer', {
-            tgUserId: Number(telegramId),
-            currency: 'DOGS',
-            amount: netAmount,
-            transferId: uniqueTxId,
-            description: `Payout for ${userId}`
-        }, {
-            headers: { 'Rocket-Pay-Key': XROCKET_API_KEY }
-        });
+const response = await axios.post('https://pay.xrocket.tg/app/transfer', {
+    tgUserId: Number(telegramId), // Must be numeric
+    currency: 'DOGS',
+    amount: Math.floor(amount * 0.6), // Net amount after 40% fee
+    transferId: uniqueTxId, // MUST be unique per request
+    description: "Watch Reward Payout"
+}, {
+    headers: { 'Rocket-Pay-Key': XROCKET_API_KEY }
+});
 
         if (response.data && response.data.success) {
             // 1. Deduct balance from user
