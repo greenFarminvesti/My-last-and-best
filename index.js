@@ -28,12 +28,7 @@ const PORT = process.env.PORT || 3000;
 
 // --- 2. STATUS PAGE ---
 app.get('/', (req, res) => {
-    res.json({ 
-        status: "Online", 
-        url: "https://my-last-and-best-production.up.railway.app",
-        firebase: db ? "Connected" : "Disconnected",
-        xrocket: XROCKET_API_KEY ? "Key Configured" : "Key Missing"
-    });
+    res.json({ status: "Online", firebase: db ? "Connected" : "Disconnected" });
 });
 
 // --- 3. WITHDRAWAL ROUTE ---
@@ -41,108 +36,74 @@ app.post('/withdraw', async (req, res) => {
     const { userId, telegramId, amount } = req.body;
     const auth = req.header('X-API-Key');
 
-    // Security Check
-    if (auth !== API_SECRET) {
-        return res.status(401).json({ success: false, error: "Invalid API Secret" });
+    if (auth !== API_SECRET) return res.status(401).json({ error: "Unauthorized" });
+    if (!db) return res.status(500).json({ error: "Database offline" });
+
+    // Validate inputs
+    const numTgId = Number(telegramId);
+    const numAmount = Number(amount);
+
+    if (!userId || isNaN(numTgId) || isNaN(numAmount) || numAmount <= 0) {
+        return res.status(400).json({ error: "Invalid parameters" });
     }
 
-    if (!db) {
-        return res.status(500).json({ success: false, error: "Database not connected" });
-    }
-
-    // Input Validation
-    if (!userId || !telegramId || !amount || amount <= 0) {
-        return res.status(400).json({ success: false, error: "Missing or invalid parameters" });
-    }
-
-    const netAmount = Math.floor(amount * 0.6); // 60% Payout to user
+    const netAmount = Math.floor(numAmount * 0.6); // 60% Payout
     const uniqueTxId = `tx_${userId}_${Date.now()}`;
 
     try {
-        // 1. Verify User Balance in Firebase
         const userRef = db.collection('users').doc(String(userId));
         const doc = await userRef.get();
         
-        if (!doc.exists) {
-            return res.status(404).json({ success: false, error: "User not found" });
-        }
+        if (!doc.exists) return res.status(404).json({ error: "User not found" });
 
-        const currentBalance = doc.data().totalBalance || 0;
-        if (currentBalance < amount) {
-            return res.status(400).json({ success: false, error: "Insufficient balance" });
-        }
+        const balance = doc.data().totalBalance || 0;
+        if (balance < numAmount) return res.status(400).json({ error: "Insufficient balance" });
 
-        // 2. Request to xRocket Pay
-        // URL based on your provided endpoint
-        const xrocketUrl = 'https://pay.xrocket.exchange/api/app/transfer';
-        
+        // --- THE FIX: Official xRocket Endpoint ---
+        // We use .tg domain and /api/transfer path
+        const xrocketUrl = 'https://pay.xrocket.tg/api/transfer';
+
         const payload = {
-            tgUserId: Number(telegramId),
+            tgUserId: numTgId,
             currency: 'DOGS',
             amount: netAmount,
             transferId: uniqueTxId,
-            description: "App Withdrawal"
+            description: "Payout from App"
         };
 
-        console.log(`📤 Requesting transfer for ${telegramId}...`);
+        console.log(`📤 Sending Payout to ${numTgId} via ${xrocketUrl}`);
 
         const response = await axios.post(xrocketUrl, payload, {
             headers: { 
                 'Rocket-Pay-Key': XROCKET_API_KEY,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
+                'Content-Type': 'application/json'
             },
             timeout: 10000
         });
 
-        // 3. Handle xRocket Response
-        if (response.data && response.data.success) {
-            // Update Firebase: Deduct balance and record withdrawal
+        if (response.data && (response.data.success || response.data.data)) {
             await userRef.update({
-                totalBalance: admin.firestore.FieldValue.increment(-amount),
-                totalWithdrawn: admin.firestore.FieldValue.increment(amount)
+                totalBalance: admin.firestore.FieldValue.increment(-numAmount),
+                totalWithdrawn: admin.firestore.FieldValue.increment(numAmount)
             });
 
-            await db.collection('withdrawals').add({
-                userId: String(userId),
-                tgId: Number(telegramId),
-                originalAmount: amount,
-                payoutAmount: netAmount,
-                status: 'completed',
-                transferId: uniqueTxId,
-                timestamp: admin.firestore.FieldValue.serverTimestamp()
-            });
-
-            return res.json({ 
-                success: true, 
-                message: "Withdrawal successful", 
-                transferId: uniqueTxId 
-            });
+            return res.json({ success: true, transferId: uniqueTxId });
         } else {
-            // Logic failure (e.g., bot has no funds)
-            console.error("❌ xRocket logic error:", response.data);
-            return res.status(400).json({ 
-                success: false, 
-                error: response.data.message || "Transfer rejected by xRocket" 
-            });
+            throw new Error(response.data?.message || "Transfer failed");
         }
 
     } catch (err) {
-        console.error("❌ API ERROR:");
-        if (err.response) {
-            // This is where you see WHY it's a "Bad Request"
-            console.error("Data:", err.response.data);
-            return res.status(400).json({ 
-                success: false, 
-                error: "xRocket Error", 
-                details: err.response.data 
-            });
-        }
-        return res.status(500).json({ success: false, error: err.message });
+        console.error("❌ API ERROR:", err.response?.data || err.message);
+        
+        // Return the specific error from xRocket
+        return res.status(err.response?.status || 500).json({
+            success: false,
+            message: "xRocket Error",
+            details: err.response?.data || err.message
+        });
     }
 });
 
-// --- 4. START SERVER ---
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server running on port ${PORT}`);
 });
