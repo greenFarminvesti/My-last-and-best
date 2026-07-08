@@ -19,13 +19,18 @@ const API_SECRET = process.env.API_SECRET;
 try {
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+        if (!admin.apps.length) {
+            admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+            console.log("✅ Firebase Initialized");
+        }
     }
-} catch (e) { console.error("Firebase Init Error"); }
+} catch (e) { console.error("❌ Firebase Init Error:", e.message); }
 const firestore = admin.apps.length ? admin.firestore() : null;
 
 // --- 2. MONGODB INIT ---
-mongoose.connect(MONGODB_URI).then(() => console.log("✅ MongoDB Connected"));
+mongoose.connect(MONGODB_URI)
+    .then(() => console.log("✅ MongoDB Connected"))
+    .catch(err => console.error("❌ MongoDB Error:", err.message));
 
 // --- 3. MODELS ---
 const userSchema = new mongoose.Schema({
@@ -36,12 +41,43 @@ const userSchema = new mongoose.Schema({
     lastWithdrawalDate: { type: Date, default: null },
 }, { strict: false });
 
-const User = mongoose.model('User', userSchema);
-const Withdrawal = mongoose.model('Withdrawal', new mongoose.Schema({
-    userId: String, telegramId: Number, amount: Number, status: String, date: { type: Date, default: Date.now }, transferId: String, error: String
-}));
+const withdrawalSchema = new mongoose.Schema({
+    userId: String,
+    telegramId: Number,
+    amount: Number,
+    status: String,
+    date: { type: Date, default: Date.now },
+    transferId: String,
+    error: String
+});
 
-// --- 4. ROUTES ---
+const User = mongoose.model('User', userSchema);
+const Withdrawal = mongoose.model('Withdrawal', withdrawalSchema);
+
+// --- 4. MIGRATION ROUTES ---
+
+// Call this in browser: /start-migration?key=YOUR_SECRET
+app.get('/start-migration', async (req, res) => {
+    if (req.query.key !== API_SECRET) return res.status(401).send("Invalid Key");
+    if (!firestore) return res.status(500).send("Firebase not connected");
+
+    try {
+        const snapshot = await firestore.collection('users').get();
+        let bulkOps = [];
+        snapshot.forEach(doc => {
+            const data = doc.data();
+            bulkOps.push({
+                updateOne: {
+                    filter: { userId: String(doc.id) },
+                    update: { $set: { ...data, userId: String(doc.id) } },
+                    upsert: true
+                }
+            });
+        });
+        if (bulkOps.length > 0) await User.bulkWrite(bulkOps);
+        res.send(`Migration Complete. Moved ${bulkOps.length} users.`);
+    } catch (e) { res.status(500).send(e.message); }
+});
 
 app.get('/migration-status', async (req, res) => {
     try {
@@ -51,9 +87,11 @@ app.get('/migration-status', async (req, res) => {
             const snap = await firestore.collection('users').count().get();
             fireCount = snap.data().count;
         }
-        res.json({ firebase_total: fireCount, mongodb_total: mongoCount, remaining: fireCount - mongoCount });
+        res.json({ firebase: fireCount, mongodb: mongoCount, remaining: fireCount - mongoCount });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// --- 5. WITHDRAWAL ROUTE ---
 
 app.post('/withdraw', async (req, res) => {
     const { userId, telegramId, amount } = req.body;
@@ -62,22 +100,18 @@ app.post('/withdraw', async (req, res) => {
     if (auth !== API_SECRET) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-        // Find user in MongoDB
         const user = await User.findOne({ userId: String(userId) });
-        if (!user) return res.status(404).json({ error: "User not found in MongoDB" });
+        if (!user) return res.status(404).json({ error: "User not in MongoDB. Run /start-migration" });
 
-        // Logic check
         if (user.totalBalance < amount) {
-            return res.status(400).json({ error: `Insufficient app balance. You have ${user.totalBalance}` });
+            return res.status(400).json({ error: `Insufficient Balance. Have: ${user.totalBalance}, Need: ${amount}` });
         }
 
         const netAmount = Number((amount * 0.6).toFixed(2));
         const uniqueId = `wd_${uuidv4()}`;
 
-        console.log(`Attempting xRocket transfer: ${netAmount} DOGS to ${telegramId}`);
-
-        // --- THE XROCKET CALL ---
         try {
+            // CALL XROCKET
             const response = await axios.post('https://pay.xrocket.tg/app/transfer', {
                 tgUserId: Number(telegramId),
                 currency: 'DOGS',
@@ -92,42 +126,23 @@ app.post('/withdraw', async (req, res) => {
             });
 
             if (response.data && response.data.success) {
-                // UPDATE DB ONLY ON SUCCESS
                 await User.findOneAndUpdate({ userId: String(userId) }, { 
                     $inc: { totalBalance: -amount, todayWithdrawals: 1 }, 
                     $set: { lastWithdrawalDate: new Date() }
                 });
-
-                await Withdrawal.create({ userId: String(userId), telegramId: Number(telegramId), amount, status: 'paid', transferId: uniqueId });
-                
+                await Withdrawal.create({ userId, telegramId, amount, status: 'paid', transferId: uniqueId });
                 return res.json({ success: true, transferId: uniqueId });
-            } else {
-                throw new Error("xRocket refused the transaction");
             }
-
         } catch (xErr) {
-            // DETAILED ERROR CATCHING
-            const xRocketErrorData = xErr.response?.data;
-            console.error("❌ xRocket API Detail Error:", JSON.stringify(xRocketErrorData));
-
-            const finalError = xRocketErrorData?.error?.message || xRocketErrorData?.message || xErr.message;
-
-            await Withdrawal.create({ 
-                userId: String(userId), 
-                amount, 
-                status: 'failed', 
-                error: finalError 
-            });
-
-            // This will now return the REAL reason (e.g., "Insufficient funds in app wallet")
-            return res.status(400).json({ 
-                error: "xRocket Error", 
-                details: finalError 
-            });
+            // THIS TELLS YOU THE EXACT PROBLEM
+            const detail = xErr.response?.data?.error?.message || xErr.response?.data?.message || xErr.message;
+            console.error("xRocket Error Detail:", detail);
+            
+            await Withdrawal.create({ userId, amount, status: 'failed', error: detail });
+            return res.status(400).json({ error: "xRocket Error", details: detail });
         }
-
     } catch (err) {
-        res.status(500).json({ error: "Internal Server Error" });
+        res.status(500).json({ error: "Server Error" });
     }
 });
 
